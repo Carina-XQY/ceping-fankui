@@ -1,0 +1,26 @@
+# 临时文件
+_uploads/
+_uploads/*
+_tools/
+反馈报告/
+反馈报告/*
+*.png
+!2.png
+!3.PNG
+!反馈报告/.gitkeep
+
+# 测试文件
+FV2.xlsx
+26秋季初三L5-思维.pdf
+_*.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+
+# IDE
+.vscode/
+.idea/

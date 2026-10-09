@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>预览与编辑报告内容</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: linear-gradient(135deg, #E3F2FD, #E1F5FE); min-height: 100vh; padding: 20px; }
+.container { max-width: 960px; margin: 0 auto; }
+.header { text-align: center; padding: 20px 0; }
+.header h1 { font-size: 26px; color: #0D47A1; margin-bottom: 6px; }
+.header p { color: #1565C0; font-size: 14px; }
+.tip-bar { background: #E3F2FD; border-left: 4px solid #42A5F5; padding: 12px 18px; border-radius: 10px; color: #0D47A1; font-size: 14px; margin: 16px 0; line-height: 1.7; }
+.tip-bar b { color: #1565C0; }
+.actions-bar { text-align: center; margin: 20px 0; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-block; padding: 12px 28px; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; font-family: inherit; text-decoration: none; transition: all 0.3s; }
+.btn-primary { background: linear-gradient(135deg, #42A5F5, #1565C0); color: white; box-shadow: 0 4px 12px rgba(33,150,243,0.3); }
+.btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(33,150,243,0.4); }
+.btn-primary:disabled { background: #B0BEC5; cursor: not-allowed; box-shadow: none; transform: none; }
+.btn-secondary { background: #fff; color: #1565C0; border: 2px solid #BBDEFB; }
+.btn-secondary:hover { background: #E3F2FD; }
+.student-card { background: #fff; border-radius: 16px; box-shadow: 0 4px 16px rgba(33,150,243,0.1); margin-bottom: 18px; overflow: hidden; }
+.card-header { background: linear-gradient(135deg, #42A5F5, #1E88E5); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
+.card-header .name { font-size: 18px; font-weight: 700; }
+.card-header .score { font-size: 14px; opacity: 0.95; }
+.card-header .score .rate { color: #FFF59D; font-weight: 700; margin-left: 6px; }
+.card-header .toggle { background: rgba(255,255,255,0.25); border: none; color: white; padding: 4px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.card-body { padding: 18px 20px; }
+.field { margin-bottom: 16px; }
+.field-label { font-size: 14px; color: #1565C0; font-weight: 700; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+.field-label .icon { font-size: 16px; }
+.field-hint { font-size: 12px; color: #90A4AE; font-weight: 400; margin-left: 6px; }
+textarea { width: 100%; padding: 10px 14px; border: 2px solid #BBDEFB; border-radius: 10px; font-size: 14px; color: #0D47A1; font-family: inherit; line-height: 1.7; resize: vertical; transition: border-color 0.3s; }
+textarea:focus { outline: none; border-color: #42A5F5; }
+.eval-area { min-height: 90px; }
+.msg-area { min-height: 60px; }
+.quote-area { min-height: 40px; font-style: italic; }
+.badges-row { background: #FFF8E1; border: 1px solid #FFE0B2; border-radius: 10px; padding: 10px 14px; font-size: 13px; color: #E65100; line-height: 1.8; }
+.badges-row .label { color: #BF360C; font-weight: 700; }
+.sug-item { background: #F5F9FF; border: 1px solid #BBDEFB; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+.sug-topic-input { width: 100%; padding: 6px 10px; border: 1px solid #BBDEFB; border-radius: 8px; font-size: 13px; color: #1565C0; font-weight: 700; margin-bottom: 6px; font-family: inherit; }
+.sug-topic-input:focus { outline: none; border-color: #42A5F5; }
+.sug-advice-input { width: 100%; padding: 6px 10px; border: 1px solid #BBDEFB; border-radius: 8px; font-size: 13px; color: #0D47A1; font-family: inherit; line-height: 1.6; resize: vertical; min-height: 38px; }
+.sug-advice-input:focus { outline: none; border-color: #42A5F5; }
+.collapsed .card-body { display: none; }
+.score-mini { font-size: 12px; color: #90A4AE; margin-top: 4px; }
+.loading { display: none; text-align: center; padding: 20px; }
+.loading.show { display: block; }
+.loading .spinner { width: 40px; height: 40px; border: 4px solid #BBDEFB; border-top-color: #42A5F5; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 10px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading p { color: #1565C0; font-size: 14px; }
+.footer { text-align: center; padding: 24px 0; color: #90A4AE; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📝 预览并编辑报告内容</h1>
+    <p>{{ cfg.test_name }} · {{ cfg.class_name }} · 满分 {{ total_max }} 分 · 共 {{ students|length }} 位学生</p>
+  </div>
+
+  <div class="tip-bar">
+    💙 这是系统自动生成的报告文字，<b>你可以直接修改任何文字</b>。改完后点底部「确认生成报告」，系统会用你编辑后的内容渲染成 PNG 图片。
+    <br>每张卡片右上角有 <b>折叠/展开</b> 按钮，需要快速浏览时可折叠。
+  </div>
+
+  <div class="actions-bar">
+    <button type="button" class="btn btn-primary" onclick="submitGenerate()">🚀 确认生成报告</button>
+    <a class="btn btn-secondary" href="/">← 返回修改基础信息</a>
+    <button type="button" class="btn btn-secondary" onclick="toggleAll(this)">🔁 全部折叠/展开</button>
+  </div>
+
+  {% for s in students %}
+  <div class="student-card" data-name="{{ s.name }}">
+    <div class="card-header">
+      <span class="name">{{ s.name }}</span>
+      <span class="score">{{ s.total|round(1)|replace('.0', '') }}/{{ s.total_max|round(0)|int }} <span class="rate">{{ s.rate }}%</span></span>
+      <button type="button" class="toggle" onclick="toggleCard(this)">折叠</button>
+    </div>
+    <div class="card-body">
+      <div class="score-mini">
+        {% for sc in s.scores %}{{ sc.name }} {{ sc.score|round(1)|replace('.0', '') }}/{{ sc.max|round(0)|int }}（{{ sc.rate }}%）；{% endfor %}
+      </div>
+
+      <div class="field">
+        <div class="field-label"><span class="icon">📋</span>综合评价</div>
+        <textarea class="eval-area" data-field="overall" data-name="{{ s.name }}">{{ s.overall|replace('<b>', '')|replace('</b>', '') }}</textarea>
+      </div>
+
+      <div class="field">
+        <div class="field-label"><span class="icon">🏆</span>学习亮点（自动按得分生成，仅供参考）</div>
+        <div class="badges-row"><span class="label">亮点：</span>{{ s.badges|join('  ·  ') }}</div>
+      </div>
+
+      <div class="field">
+        <div class="field-label"><span class="icon">💡</span>成长建议 <span class="field-hint">（按薄弱板块排序，知识点和建议都可改）</span></div>
+        {% for sug in s.suggestions %}
+        <div class="sug-item">
+          <input type="text" class="sug-topic-input" data-field="sug-topic" data-name="{{ s.name }}" data-idx="{{ loop.index0 }}" value="{{ sug.topic }}">
+          <textarea class="sug-advice-input" data-field="sug-advice" data-name="{{ s.name }}" data-idx="{{ loop.index0 }}">{{ sug.advice }}</textarea>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="field">
+        <div class="field-label"><span class="icon">💌</span>教师寄语</div>
+        <textarea class="msg-area" data-field="teacher_msg" data-name="{{ s.name }}">{{ s.teacher_msg }}</textarea>
+      </div>
+
+      <div class="field">
+        <div class="field-label"><span class="icon">✨</span>英文格言</div>
+        <textarea class="quote-area" data-field="teacher_quote" data-name="{{ s.name }}">{{ s.teacher_quote }}</textarea>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="actions-bar">
+    <button type="button" class="btn btn-primary" onclick="submitGenerate()">🚀 确认生成报告</button>
+    <a class="btn btn-secondary" href="/">← 返回修改基础信息</a>
+  </div>
+
+  <div class="loading" id="genLoading">
+    <div class="spinner"></div>
+    <p>正在渲染报告图片（每位学生约1秒）...</p>
+  </div>
+
+  <div class="footer">飞扬精准自学 · 测评反馈报告生成器</div>
+</div>
+
+<script>
+// 原始表单数据（从后端传入，确认生成时回传给 /generate）
+const FORM_DATA = {{ form_data|tojson }};
+const LOGO_PATH = {{ logo_path|tojson }};
+const MASCOT_PATH = {{ mascot_path|tojson }};
+
+function toggleCard(btn) {
+  const card = btn.closest('.student-card');
+  card.classList.toggle('collapsed');
+  btn.textContent = card.classList.contains('collapsed') ? '展开' : '折叠';
+}
+
+function toggleAll(btn) {
+  const cards = document.querySelectorAll('.student-card');
+  const anyCollapsed = Array.from(cards).some(c => c.classList.contains('collapsed'));
+  cards.forEach(c => {
+    const btn = c.querySelector('.toggle');
+    if (anyCollapsed) {
+      c.classList.remove('collapsed');
+      btn.textContent = '折叠';
+    } else {
+      c.classList.add('collapsed');
+      btn.textContent = '展开';
+    }
+  });
+  btn.textContent = anyCollapsed ? '全部折叠' : '全部展开';
+}
+
+function collectEditedContent() {
+  // 收集每位学生的编辑内容
+  const map = {};
+  // 综合评价
+  document.querySelectorAll('textarea[data-field="overall"]').forEach(t => {
+    const name = t.dataset.name;
+    if (!map[name]) map[name] = {};
+    map[name].overall = t.value;
+  });
+  // 教师寄语
+  document.querySelectorAll('textarea[data-field="teacher_msg"]').forEach(t => {
+    const name = t.dataset.name;
+    if (!map[name]) map[name] = {};
+    map[name].teacher_msg = t.value;
+  });
+  // 英文格言
+  document.querySelectorAll('textarea[data-field="teacher_quote"]').forEach(t => {
+    const name = t.dataset.name;
+    if (!map[name]) map[name] = {};
+    map[name].teacher_quote = t.value;
+  });
+  // 成长建议：按 idx 收集成 [[topic, advice], ...]
+  const sugMap = {}; // {name: {idx: [topic, advice]}}
+  document.querySelectorAll('input[data-field="sug-topic"]').forEach(inp => {
+    const name = inp.dataset.name;
+    const idx = parseInt(inp.dataset.idx);
+    if (!sugMap[name]) sugMap[name] = {};
+    if (!sugMap[name][idx]) sugMap[name][idx] = ['', ''];
+    sugMap[name][idx][0] = inp.value;
+  });
+  document.querySelectorAll('textarea[data-field="sug-advice"]').forEach(t => {
+    const name = t.dataset.name;
+    const idx = parseInt(t.dataset.idx);
+    if (!sugMap[name]) sugMap[name] = {};
+    if (!sugMap[name][idx]) sugMap[name][idx] = ['', ''];
+    sugMap[name][idx][1] = t.value;
+  });
+  Object.entries(sugMap).forEach(([name, idxMap]) => {
+    if (!map[name]) map[name] = {};
+    const sorted = Object.keys(idxMap).map(k => parseInt(k)).sort((a, b) => a - b);
+    map[name].suggestions = sorted.map(i => idxMap[i]);
+  });
+  return map;
+}
+
+function submitGenerate() {
+  const editedMap = collectEditedContent();
+
+  const formData = new FormData();
+  formData.append('file_id', FORM_DATA.file_id);
+  formData.append('class_name', FORM_DATA.class_name);
+  formData.append('semester', FORM_DATA.semester);
+  formData.append('subject', FORM_DATA.subject);
+  formData.append('test_name', FORM_DATA.test_name);
+  formData.append('teacher', FORM_DATA.teacher);
+  formData.append('date', FORM_DATA.date);
+  formData.append('section_advice', FORM_DATA.section_advice);
+  formData.append('edited_content', JSON.stringify(editedMap));
+  if (LOGO_PATH) formData.append('logo_path', LOGO_PATH);
+  if (MASCOT_PATH) formData.append('mascot_path', MASCOT_PATH);
+
+  // 锁定按钮 + 显示加载
+  document.querySelectorAll('.btn-primary').forEach(b => b.disabled = true);
+  document.getElementById('genLoading').classList.add('show');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+
+  fetch('/generate', { method: 'POST', body: formData })
+    .then(r => r.text())
+    .then(html => {
+      document.open();
+      document.write(html);
+      document.close();
+    })
+    .catch(err => {
+      document.getElementById('genLoading').classList.remove('show');
+      document.querySelectorAll('.btn-primary').forEach(b => b.disabled = false);
+      alert('生成失败: ' + err.message);
+    });
+}
+</script>
+</body>
+</html>

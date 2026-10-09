@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>测评反馈报告生成器</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: linear-gradient(135deg, #E3F2FD, #E1F5FE); min-height: 100vh; padding: 20px; }
+.container { max-width: 720px; margin: 0 auto; }
+.header { text-align: center; padding: 30px 0 20px; }
+.header h1 { font-size: 28px; color: #0D47A1; margin-bottom: 6px; }
+.header p { color: #1565C0; font-size: 15px; }
+.card { background: #fff; border-radius: 20px; padding: 30px; box-shadow: 0 4px 20px rgba(33,150,243,0.1); margin-bottom: 20px; }
+.card-title { font-size: 18px; color: #1565C0; margin-bottom: 20px; display: flex; align-items: center; gap: 8px; }
+.form-group { margin-bottom: 16px; }
+.form-row { display: flex; gap: 16px; }
+.form-row .form-group { flex: 1; }
+label { display: block; font-size: 14px; color: #1565C0; margin-bottom: 6px; font-weight: 600; }
+input[type="text"], input[type="date"], textarea, select {
+  width: 100%; padding: 10px 14px; border: 2px solid #BBDEFB; border-radius: 10px; font-size: 14px; color: #0D47A1;
+  font-family: inherit; transition: border-color 0.3s;
+}
+input[type="text"]:focus, input[type="date"]:focus, textarea:focus, select:focus { outline: none; border-color: #42A5F5; }
+textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
+/* 文件上传区 */
+.upload-zone { border: 3px dashed #BBDEFB; border-radius: 14px; padding: 40px 20px; text-align: center; cursor: pointer; transition: all 0.3s; background: #F5F9FF; }
+.upload-zone:hover, .upload-zone.dragover { border-color: #42A5F5; background: #E3F2FD; }
+.upload-zone .icon { font-size: 40px; margin-bottom: 10px; }
+.upload-zone .text { color: #1565C0; font-size: 15px; }
+.upload-zone .hint { color: #90A4AE; font-size: 13px; margin-top: 6px; }
+.upload-zone input { display: none; }
+.file-info { display: none; margin-top: 12px; padding: 10px 14px; background: #E3F2FD; border-radius: 10px; font-size: 13px; color: #1565C0; }
+.file-info.show { display: block; }
+/* 板块分析 */
+.sections-area { display: none; margin-top: 16px; }
+.sections-area.show { display: block; }
+.section-card { background: #F5F9FF; border: 1px solid #BBDEFB; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.section-card .sec-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.section-card .sec-name { font-weight: 700; color: #0D47A1; font-size: 15px; }
+.section-card .sec-max { background: #42A5F5; color: white; padding: 2px 10px; border-radius: 12px; font-size: 13px; }
+.section-card .sec-fields { display: flex; gap: 10px; }
+.section-card .sec-fields .field-topic { flex: 0 0 140px; }
+.section-card .sec-fields .field-advice { flex: 1; }
+/* 按钮 */
+.btn { display: inline-block; padding: 14px 36px; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.3s; }
+.btn-primary { background: linear-gradient(135deg, #42A5F5, #1565C0); color: white; box-shadow: 0 4px 12px rgba(33,150,243,0.3); }
+.btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(33,150,243,0.4); }
+.btn-primary:disabled { background: #B0BEC5; cursor: not-allowed; box-shadow: none; transform: none; }
+.btn-secondary { background: #E3F2FD; color: #1565C0; }
+.btn-secondary:hover { background: #BBDEFB; }
+.actions { text-align: center; padding: 10px 0; }
+/* 错误提示 */
+.error-msg { display: none; margin: 0 0 16px; padding: 12px 16px; background: #FFEBEE; border: 1px solid #EF9A9A; border-radius: 10px; color: #C62828; font-size: 14px; }
+.error-msg.show { display: block; }
+/* 加载中 */
+.loading { display: none; text-align: center; padding: 20px; }
+.loading.show { display: block; }
+.loading .spinner { width: 40px; height: 40px; border: 4px solid #BBDEFB; border-top-color: #42A5F5; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 10px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading p { color: #1565C0; font-size: 14px; }
+.optional-label { font-size: 12px; color: #90A4AE; font-weight: 400; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📖 测评反馈报告生成器</h1>
+    <p>上传成绩表，一键生成个性化反馈报告</p>
+  </div>
+
+  {% if error %}
+  <div class="error-msg show">{{ error }}</div>
+  {% endif %}
+
+  <!-- 上传成绩表 -->
+  <div class="card">
+    <div class="card-title">📄 第一步：上传成绩表</div>
+    <div class="upload-zone" id="uploadZone" onclick="document.getElementById('excelInput').click()">
+      <div class="icon">📊</div>
+      <div class="text">点击或拖拽 Excel 文件到此处</div>
+      <div class="hint">支持 .xlsx / .xls 格式，表头需包含「姓名」和「板块名（满分）」</div>
+      <input type="file" id="excelInput" accept=".xlsx,.xls">
+    </div>
+    <div class="file-info" id="fileInfo"></div>
+    <div class="loading" id="analyzeLoading">
+      <div class="spinner"></div>
+      <p>正在解析成绩表...</p>
+    </div>
+    <input type="hidden" id="fileId" name="file_id">
+  </div>
+
+  <!-- 试卷上传 -->
+  <div class="card" id="pdfCard">
+    <div class="card-title">📄 第二步：上传试卷 <span class="optional-label">（推荐，自动分析考点）</span></div>
+    <p style="font-size:13px;color:#90A4AE;margin-bottom:14px;">上传试卷 PDF，系统会自动提取考点，为每个板块生成精准的知识点和学习建议。可先传成绩表再传试卷，也可先传试卷再传成绩表。</p>
+    <div class="upload-zone" id="pdfUploadZone" onclick="document.getElementById('pdfInput').click()">
+      <div class="icon">📋</div>
+      <div class="text">点击或拖拽 试卷 PDF 到此处</div>
+      <div class="hint">支持 .pdf 格式，上传后自动分析考点并填充下方建议</div>
+      <input type="file" id="pdfInput" accept=".pdf">
+    </div>
+    <div class="file-info" id="pdfFileInfo"></div>
+    <div class="loading" id="pdfLoading">
+      <div class="spinner"></div>
+      <p>正在分析试卷内容...</p>
+    </div>
+  </div>
+
+  <!-- 板块建议（解析后显示） -->
+  <div class="card sections-area" id="sectionsCard">
+    <div class="card-title">📝 第三步：检查板块建议（可编辑）</div>
+    <p style="font-size:13px;color:#90A4AE;margin-bottom:14px;">系统已根据表头自动识别板块，以下建议将用于「成长建议」板块，可按需修改。</p>
+    <div id="sectionsList"></div>
+  </div>
+
+  <!-- 基本信息填写 -->
+  <div class="card">
+    <div class="card-title">✏️ 第四步：填写基本信息</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>班级名称</label>
+        <input type="text" name="class_name" placeholder="如：FV2班">
+      </div>
+      <div class="form-group">
+        <label>学期</label>
+        <input type="text" name="semester" placeholder="如：初三秋季">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>测试名称</label>
+      <input type="text" name="test_name" placeholder="如：Lesson 5 Unit 1-4 小测">
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>科目</label>
+        <input type="text" name="subject" value="英语">
+      </div>
+      <div class="form-group">
+        <label>教师姓名</label>
+        <input type="text" name="teacher" placeholder="如：赵老师">
+      </div>
+      <div class="form-group">
+        <label>日期</label>
+        <input type="text" name="date" value="auto" placeholder="auto=自动取今天">
+      </div>
+    </div>
+  </div>
+
+  <!-- Logo 和吉祥物（可选） -->
+  <div class="card">
+    <div class="card-title">🎨 自定义图片 <span class="optional-label">（可选，不传用默认）</span></div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Logo 图片</label>
+        <input type="file" name="logo" accept="image/*" style="border:none;padding:0;">
+      </div>
+      <div class="form-group">
+        <label>吉祥物图片</label>
+        <input type="file" name="mascot" accept="image/*" style="border:none;padding:0;">
+      </div>
+    </div>
+  </div>
+
+  <!-- 生成按钮 -->
+  <div class="actions">
+    <button type="button" class="btn btn-primary" id="generateBtn" disabled onclick="submitGenerate()">
+      📝 预览并编辑报告
+    </button>
+  </div>
+  <div class="loading" id="genLoading">
+    <div class="spinner"></div>
+    <p>正在生成预览内容...</p>
+  </div>
+</div>
+
+<script>
+// ---- 拖拽上传 ----
+const uploadZone = document.getElementById('uploadZone');
+const excelInput = document.getElementById('excelInput');
+
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) { excelInput.files = e.dataTransfer.files; handleExcelUpload(); }
+});
+excelInput.addEventListener('change', handleExcelUpload);
+
+// ---- 上传并解析 Excel ----
+function handleExcelUpload() {
+  const file = excelInput.files[0];
+  if (!file) return;
+
+  document.getElementById('fileInfo').classList.remove('show');
+  document.getElementById('analyzeLoading').classList.add('show');
+  document.getElementById('sectionsCard').classList.remove('show');
+  document.getElementById('generateBtn').disabled = true;
+
+  const formData = new FormData();
+  formData.append('excel', file);
+
+  fetch('/api/analyze', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('analyzeLoading').classList.remove('show');
+      if (data.error) {
+        alert('解析失败: ' + data.error);
+        return;
+      }
+      // 显示文件信息
+      const fi = document.getElementById('fileInfo');
+      fi.innerHTML = `✅ 已识别 <b>${data.student_count}</b> 位学生，<b>${data.sections.length}</b> 个板块，满分 <b>${data.total_max}</b> 分`;
+      fi.classList.add('show');
+
+      // 保存 file_id
+      document.getElementById('fileId').value = data.file_id;
+
+      // 渲染板块建议编辑区
+      renderSections(data.sections);
+      document.getElementById('sectionsCard').classList.add('show');
+      document.getElementById('generateBtn').disabled = false;
+    })
+    .catch(err => {
+      document.getElementById('analyzeLoading').classList.remove('show');
+      alert('上传失败: ' + err.message);
+    });
+}
+
+// ---- 渲染板块建议编辑区 ----
+function renderSections(sections) {
+  const container = document.getElementById('sectionsList');
+  container.innerHTML = '';
+  sections.forEach((sec, i) => {
+    const card = document.createElement('div');
+    card.className = 'section-card';
+    card.innerHTML = `
+      <div class="sec-header">
+        <span class="sec-name">${sec.name}</span>
+        <span class="sec-max">满分 ${sec.max}</span>
+      </div>
+      <div class="sec-fields">
+        <div class="field-topic">
+          <input type="text" class="sec-topic-input" data-sec="${sec.name}" placeholder="知识点" value="${sec.topic}">
+        </div>
+        <div class="field-advice">
+          <textarea class="sec-advice-input" data-sec="${sec.name}" placeholder="学习建议" rows="2">${sec.advice}</textarea>
+        </div>
+      </div>`;
+    container.appendChild(card);
+  });
+  // 如果已有PDF分析结果，自动填充到板块
+  applyPdfAdvice();
+}
+
+// ---- PDF 试卷上传 ----
+const pdfUploadZone = document.getElementById('pdfUploadZone');
+const pdfInput = document.getElementById('pdfInput');
+
+// 存储PDF分析结果，等板块渲染后自动填充
+let pdfAdviceMap = null;
+
+pdfUploadZone.addEventListener('dragover', e => { e.preventDefault(); pdfUploadZone.classList.add('dragover'); });
+pdfUploadZone.addEventListener('dragleave', () => pdfUploadZone.classList.remove('dragover'));
+pdfUploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  pdfUploadZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) { pdfInput.files = e.dataTransfer.files; handlePdfUpload(); }
+});
+pdfInput.addEventListener('change', handlePdfUpload);
+
+function applyPdfAdvice() {
+  if (!pdfAdviceMap) return;
+  Object.entries(pdfAdviceMap).forEach(([secName, info]) => {
+    const topicInput = document.querySelector(`.sec-topic-input[data-sec="${secName}"]`);
+    const adviceInput = document.querySelector(`.sec-advice-input[data-sec="${secName}"]`);
+    if (topicInput) topicInput.value = info.topic;
+    if (adviceInput) adviceInput.value = info.advice;
+  });
+}
+
+function handlePdfUpload() {
+  const file = pdfInput.files[0];
+  if (!file) return;
+
+  document.getElementById('pdfFileInfo').classList.remove('show');
+  document.getElementById('pdfLoading').classList.add('show');
+
+  // 收集当前板块名列表（如果已上传Excel）
+  let sectionNames = [];
+  document.querySelectorAll('.sec-topic-input').forEach(inp => sectionNames.push(inp.dataset.sec));
+  // 如果还没上传Excel，用默认板块名
+  if (sectionNames.length === 0) {
+    sectionNames = ['单词', '短语', '单选', '填空', '翻译'];
+  }
+
+  const formData = new FormData();
+  formData.append('pdf', file);
+  formData.append('section_names', JSON.stringify(sectionNames));
+
+  fetch('/api/analyze_pdf', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('pdfLoading').classList.remove('show');
+      if (data.error) {
+        alert('试卷分析失败: ' + data.error);
+        return;
+      }
+
+      // 保存分析结果
+      pdfAdviceMap = data.advice_map;
+
+      // 显示分析结果
+      const fi = document.getElementById('pdfFileInfo');
+      const detected = Object.keys(data.advice_map);
+      const hasSections = document.querySelectorAll('.sec-topic-input').length > 0;
+      if (hasSections) {
+        fi.innerHTML = `✅ 已分析 <b>${detected.length}</b> 个板块考点，建议已自动填充到下方`;
+      } else {
+        fi.innerHTML = `✅ 已分析 <b>${detected.length}</b> 个板块考点，上传成绩表后自动填充`;
+      }
+      fi.classList.add('show');
+
+      // 自动填充板块建议（如果板块已渲染）
+      applyPdfAdvice();
+
+      // 如果板块已显示，滚动到板块建议区
+      if (hasSections) {
+        document.getElementById('sectionsCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    })
+    .catch(err => {
+      document.getElementById('pdfLoading').classList.remove('show');
+      alert('上传失败: ' + err.message);
+    });
+}
+
+// ---- 提交生成 ----
+function submitGenerate() {
+  const fileId = document.getElementById('fileId').value;
+  if (!fileId) { alert('请先上传成绩表'); return; }
+
+  // 收集板块建议
+  const sectionAdvice = {};
+  document.querySelectorAll('.sec-topic-input').forEach(inp => {
+    const sec = inp.dataset.sec;
+    if (!sectionAdvice[sec]) sectionAdvice[sec] = {};
+    sectionAdvice[sec].topic = inp.value;
+  });
+  document.querySelectorAll('.sec-advice-input').forEach(inp => {
+    const sec = inp.dataset.sec;
+    sectionAdvice[sec].advice = inp.value;
+  });
+
+  // 构建表单
+  const formData = new FormData();
+  formData.append('file_id', fileId);
+  formData.append('class_name', document.querySelector('[name=class_name]').value);
+  formData.append('semester', document.querySelector('[name=semester]').value);
+  formData.append('subject', document.querySelector('[name=subject]').value);
+  formData.append('test_name', document.querySelector('[name=test_name]').value);
+  formData.append('teacher', document.querySelector('[name=teacher]').value);
+  formData.append('date', document.querySelector('[name=date]').value);
+  formData.append('section_advice', JSON.stringify(sectionAdvice));
+
+  // 可选图片
+  const logoFile = document.querySelector('[name=logo]').files[0];
+  if (logoFile) formData.append('logo', logoFile);
+  const mascotFile = document.querySelector('[name=mascot]').files[0];
+  if (mascotFile) formData.append('mascot', mascotFile);
+
+  // 显示加载
+  document.getElementById('generateBtn').disabled = true;
+  document.getElementById('genLoading').classList.add('show');
+
+  // 创建临时表单提交（支持文件上传+重定向）
+  const tempForm = document.createElement('form');
+  tempForm.method = 'POST';
+  tempForm.action = '/preview';
+  tempForm.enctype = 'multipart/form-data';
+  for (const [k, v] of formData.entries()) {
+    const input = document.createElement('input');
+    input.name = k;
+    if (typeof v === 'string') {
+      input.value = v;
+    } else {
+      // 文件对象需要特殊处理
+      try { input.files = [v]; } catch(e) {}
+    }
+    tempForm.appendChild(input);
+  }
+  // 直接用 fetch 提交 FormData
+  fetch('/preview', { method: 'POST', body: formData })
+    .then(r => r.text())
+    .then(html => {
+      document.open();
+      document.write(html);
+      document.close();
+    })
+    .catch(err => {
+      document.getElementById('genLoading').classList.remove('show');
+      document.getElementById('generateBtn').disabled = false;
+      alert('生成失败: ' + err.message);
+    });
+}
+</script>
+</body>
+</html>

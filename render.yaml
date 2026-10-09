@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ce-ping-fan-kui-bao-gao
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python -m playwright install chromium"
+    startCommand: "python app.py"
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.9.0
