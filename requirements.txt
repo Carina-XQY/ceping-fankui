@@ -3,3 +3,4 @@ openpyxl==3.1.5
 pillow==10.4.0
 pdfplumber==0.11.4
 playwright==1.48.0
+greenlet>=3.2.0
