@@ -1474,7 +1474,10 @@ def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, 
     generated = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                  "--disable-gpu", "--single-process", "--disable-software-rasterizer"]
+        )
         page = browser.new_page(viewport={"width": 880, "height": 1200})
 
         for name, scores, total in students:
