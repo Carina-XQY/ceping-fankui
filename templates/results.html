@@ -60,22 +60,23 @@ body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: li
   </div>
 
   <div class="actions-bar">
-    <a class="btn btn-primary" href="/download_all">📦 打包下载全部</a>
+    <a class="btn btn-primary" href="/download_all">📦 打包下载全部（PNG+PDF）</a>
     <a class="btn btn-secondary" href="/">← 返回首页</a>
   </div>
 
   <div class="gallery">
-    {% for name, total, total_max, filename in reports %}
+    {% for name, total, total_max, img_name, pdf_name in reports %}
     <div class="report-card">
-      <a href="/reports/{{ filename }}" target="_blank">
-        <img src="/reports/{{ filename }}" alt="{{ name }}" loading="lazy">
+      <a href="/reports/{{ img_name }}" target="_blank">
+        <img src="/reports/{{ img_name }}" alt="{{ name }}" loading="lazy">
       </a>
       <div class="info">
         <span class="name">{{ name }}</span>
         <span class="score">{{ total }}/{{ total_max }} <span class="rate">({{ ((total/total_max*100)|round(0)) if total_max > 0 else 0 }}%)</span></span>
       </div>
       <div class="actions">
-        <a class="btn-sm" href="/reports/{{ filename }}" download="{{ filename }}">⬇ 下载</a>
+        <a class="btn-sm" href="/reports/{{ img_name }}" download="{{ img_name }}">🖼 PNG</a>
+        <a class="btn-sm" href="/reports_pdf/{{ pdf_name }}" download="{{ pdf_name }}">📄 PDF</a>
       </div>
     </div>
     {% endfor %}

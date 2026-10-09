@@ -78,9 +78,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
     <div class="card-title">📄 第一步：上传成绩表</div>
     <div class="upload-zone" id="uploadZone" onclick="document.getElementById('excelInput').click()">
       <div class="icon">📊</div>
-      <div class="text">点击或拖拽 Excel 文件到此处</div>
-      <div class="hint">支持 .xlsx / .xls 格式，表头需包含「姓名」和「板块名（满分）」</div>
-      <input type="file" id="excelInput" accept=".xlsx,.xls">
+      <div class="text">点击或拖拽成绩表文件到此处</div>
+      <div class="hint">支持 .xlsx / .xls / .csv 格式，表头需含「姓名」和「板块名」（满分可省略，系统自动推断）</div>
+      <input type="file" id="excelInput" accept=".xlsx,.xls,.csv">
     </div>
     <div class="file-info" id="fileInfo"></div>
     <div class="loading" id="analyzeLoading">

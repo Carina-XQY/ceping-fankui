@@ -4,15 +4,19 @@ _uploads/*
 _tools/
 反馈报告/
 反馈报告/*
-*.png
-!2.png
-!3.PNG
-!反馈报告/.gitkeep
 
 # 测试文件
 FV2.xlsx
 26秋季初三L5-思维.pdf
-_*.py
+_test_*
+_test_*.py
+_test_*.csv
+_test_*.png
+
+# 图片（保留 Logo 和吉祥物）
+*.png
+!2.png
+!3.PNG
 
 # Python
 __pycache__/
@@ -24,3 +28,9 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# 本地工具文件
+一键启动.sh
+项目说明.md
+部署指南.md
+cpolar*

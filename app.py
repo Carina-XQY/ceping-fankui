@@ -67,14 +67,15 @@ def img_to_b64(path):
 #  Excel 解析（自动从表头提取满分）
 # ============================================================
 def parse_headers(headers):
-    """从表头列表解析出板块名和满分，返回 [(name, max), ...] 和姓名列索引、总分列索引
-    支持多种满分格式：
-      - 单词(30) / 单词（30）  圆括号
-      - 单词[30] / 单词【30】  方括号
-      - 单词/30  斜杠
-      - 单词 30分  后缀分
-      - 单词 满分30 / 单词 满分：30  满分前缀
-      - 单词（满分30）  满分+数字
+    """宽松解析表头：任何非姓名/总分列都视为板块列，满分从表头提取或后续从数据推断。
+    支持的满分格式（按优先级）：
+      - 圆括号: 单词(30) / 单词（30）/ 单词（满分30）/ 单词（30分）
+      - 方括号: 单词[30] / 单词【30】
+      - 斜杠: 单词/30
+      - 后缀分: 单词 30分
+      - 满分前缀: 单词 满分30 / 单词 满分：30
+      - 纯数字: 单词 30
+    若表头无数字，max_score 返回 None，由 load_excel 从数据推断。
     """
     sections = []
     score_indices = []
@@ -82,13 +83,18 @@ def parse_headers(headers):
     total_idx = None
     for i, h in enumerate(headers):
         h = str(h) if h else ""
-        # 姓名列
-        if h in ("姓名", "名字", "学生", "name", "Name"):
+        h_strip = h.strip()
+        if not h_strip:
+            continue
+        # 姓名列（宽松匹配：表头含「姓名/名字/学生/name」即识别）
+        if any(k in h_strip for k in ("姓名", "名字", "学生")) or \
+           h_strip.lower() in ("name", "student"):
             name_idx = i
             continue
-        # 总分列（支持「总分」「总分(120)」「合计」「总分（满分）」等）
+        # 总分列（宽松匹配：表头含「总分/合计/total」即识别）
         h_clean = re.sub(r"\s*[（(].*?[)）]", "", h).strip()
-        if h_clean in ("总分", "合计", "Total", "total") or \
+        if any(k in h_strip for k in ("总分", "合计")) or \
+           h_clean.lower() in ("total",) or \
            re.sub(r"\s*\d+(?:\.\d+)?\s*分?\s*$", "", h_clean).strip() in ("总分", "合计"):
             total_idx = i
             continue
@@ -130,21 +136,153 @@ def parse_headers(headers):
             if m:
                 max_score = float(m.group(1))
                 name = re.sub(r"\s*\d+(?:\.\d+)?\s*", "", h).strip()
-
-        if max_score is not None and name:
+        # 7) 表头无数字（如纯「单词」「短语」「阅读」），max_score=None，后续从数据推断
+        if max_score is None:
+            name = h_strip
+        # 板块名清洗：去掉常见后缀（「得分」「成绩」「分数」）
+        name = re.sub(r"\s*[得分成绩分数]+\s*$", "", name).strip()
+        if name:
             sections.append((name, max_score))
             score_indices.append(i)
     return sections, score_indices, name_idx, total_idx
+
+
+def infer_max_from_column(values):
+    """从一列得分数据推断满分：取最大值；若最大值为0或无效，返回 100 兜底"""
+    valid = [v for v in values if v is not None and v > 0]
+    if not valid:
+        return 100.0
+    max_val = max(valid)
+    # 满分通常是整数且是 5/10 的倍数，但这里直接用最大值更通用
+    return float(max_val)
+
+
+def ocr_image_to_rows(path):
+    """用 macOS Vision API 识别图片中的表格，返回 rows = [[cell, cell, ...], ...]
+    Vision API 按行识别文字，然后按 Y 坐标聚类成行，按 X 坐标排序成列。
+    """
+    try:
+        from Vision import VNRecognizeTextRequest, VNImageRequestHandler
+        from Quartz import CIImage, NSURL
+    except ImportError:
+        print("Vision API 不可用，无法识别图片")
+        return None
+
+    url = NSURL.fileURLWithPath_(path)
+    ci_image = CIImage.imageWithContentsOfURL_(url)
+    if ci_image is None:
+        print("无法加载图片")
+        return None
+
+    request = VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(1)  # 1 = accurate
+    request.setRecognitionLanguages_(["zh-Hans", "zh-Hant", "en"])
+    request.setUsesLanguageCorrection_(True)
+
+    handler = VNImageRequestHandler.alloc().initWithCIImage_options_(ci_image, None)
+    success, error = handler.performRequests_error_([request], None)
+    if not success:
+        print(f"OCR 识别失败: {error}")
+        return None
+
+    results = request.results()
+    if not results:
+        return None
+
+    # 收集每个识别结果的文字和位置
+    # boundingBox: (x, y, w, h) in normalized coordinates (0-1), origin at bottom-left
+    items = []
+    for obs in results:
+        try:
+            candidate = obs.topCandidates_(1)[0]
+            text = str(candidate.string())
+        except Exception:
+            continue
+        bbox = obs.boundingBox()
+        origin_x = float(bbox.origin.x)
+        origin_y = float(bbox.origin.y)
+        width = float(bbox.size.width)
+        height = float(bbox.size.height)
+        # 转换为 top-left origin
+        y_top = 1.0 - (origin_y + height)
+        x_center = origin_x + width / 2
+        items.append({"text": text, "x": origin_x, "xc": x_center, "y": y_top, "h": height, "w": width})
+
+    if not items:
+        return None
+
+    # 按 Y 坐标聚类成行
+    items.sort(key=lambda t: (t["y"], t["x"]))
+    rows_raw = []
+    current_row = []
+    current_y = None
+    y_tolerance = 0.025  # 2.5% 的 Y 容差
+
+    for item in items:
+        if current_y is None or abs(item["y"] - current_y) <= y_tolerance:
+            current_row.append(item)
+            if current_y is None:
+                current_y = item["y"]
+        else:
+            if current_row:
+                rows_raw.append(current_row)
+            current_row = [item]
+            current_y = item["y"]
+    if current_row:
+        rows_raw.append(current_row)
+
+    # 每行内按 X 坐标排序，输出单元格
+    rows = []
+    for row_items in rows_raw:
+        row_items.sort(key=lambda t: t["x"])
+        # 合并相邻且距离很近的文字为一个单元格
+        merged = []
+        for item in row_items:
+            if merged and abs(item["x"] - (merged[-1]["x"] + merged[-1]["w"])) < 0.015:
+                # 合并
+                merged[-1]["text"] += item["text"]
+                merged[-1]["w"] = (item["x"] + item["w"]) - merged[-1]["x"]
+            else:
+                merged.append(dict(item))
+        cells = [c["text"].strip() for c in merged if c["text"].strip()]
+        if cells:
+            rows.append(cells)
+
+    return rows
 
 
 def load_excel(path):
     """返回 (students, sections)
     students = [(姓名, {板块: 得分}, 总分), ...]
     sections  = [(板块名, 满分), ...]
+    宽松策略：表头没有满分时，从该列数据取最大值作为满分。
+    支持 .xlsx / .xls / .csv（含 GBK/UTF-8 自动检测）/ 图片（.png/.jpg/.jpeg 用 OCR）
     """
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    rows = list(ws.iter_rows(values_only=True))
+    import csv as csv_mod
+    lower = path.lower()
+    # 图片格式：用 macOS Vision API OCR 识别
+    if lower.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
+        rows = ocr_image_to_rows(path)
+        if not rows:
+            raise RuntimeError("图片识别失败，请确保图片清晰，或改用 Excel/CSV 格式")
+    elif lower.endswith(".csv"):
+        # 自动检测编码
+        text_rows = None
+        for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "big5"):
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv_mod.reader(f)
+                    text_rows = [row for row in reader]
+                break
+            except (UnicodeDecodeError, Exception):
+                continue
+        if not text_rows:
+            return [], []
+        rows = text_rows
+    else:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return [], []
 
@@ -152,26 +290,43 @@ def load_excel(path):
     sections, score_indices, name_idx, total_idx = parse_headers(headers)
 
     if name_idx is None:
+        # 没有明确姓名列时，默认第 0 列
         name_idx = 0
 
     students = []
     for row in rows[1:]:
+        # 跳过完全空行
+        if not any(c not in (None, "", " ") for c in row):
+            continue
         name = row[name_idx] if name_idx < len(row) else None
-        if not name:
+        if not name or str(name).strip() == "":
             continue
         scores = {}
         for sec_idx, col_idx in enumerate(score_indices):
             if col_idx < len(row):
                 sec_name = sections[sec_idx][0]
                 val = row[col_idx]
-                scores[sec_name] = float(val) if val is not None else 0
+                try:
+                    scores[sec_name] = float(val) if val not in (None, "", " ") else 0
+                except (ValueError, TypeError):
+                    scores[sec_name] = 0
 
         if total_idx is not None and total_idx < len(row) and row[total_idx] is not None:
-            total = float(row[total_idx])
+            try:
+                total = float(row[total_idx])
+            except (ValueError, TypeError):
+                total = sum(scores.values())
         else:
             total = sum(scores.values())
 
-        students.append((str(name), scores, total))
+        students.append((str(name).strip(), scores, total))
+
+    # 对表头没有满分的板块，从数据推断
+    for sec_idx, (name, max_score) in enumerate(sections):
+        if max_score is None:
+            col_values = [s[name] for _, s, _ in students if name in s]
+            inferred = infer_max_from_column(col_values)
+            sections[sec_idx] = (name, inferred)
 
     return students, sections
 
@@ -1325,20 +1480,29 @@ def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, 
         for name, scores, total in students:
             edited = edited_map.get(name, {})
             html = build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64, edited=edited)
-            html_path = os.path.join(output_dir, f"_tmp_{name}.html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
 
-            page.goto(f"file://{html_path}")
+            # 直接设置页面内容（避免中文路径问题）
+            page.set_content(html, wait_until="load")
             page.wait_for_timeout(600)
 
+            # 生成 PNG
             img_name = f"{name}_反馈报告.png"
             img_path = os.path.join(output_dir, img_name)
             el = page.query_selector(".report")
             el.screenshot(path=img_path)
-            os.remove(html_path)
 
-            generated.append((name, total, total_max, img_name))
+            # 生成 PDF（从 PNG 转换，保证排版一致）
+            pdf_name = f"{name}_反馈报告.pdf"
+            pdf_path = os.path.join(output_dir, pdf_name)
+            try:
+                pdf_img = Image.open(img_path)
+                if pdf_img.mode == "RGBA":
+                    pdf_img = pdf_img.convert("RGB")
+                pdf_img.save(pdf_path, "PDF", resolution=150.0)
+            except Exception as e:
+                print(f"  ⚠ PDF 生成失败 {name}: {e}")
+
+            generated.append((name, total, total_max, img_name, pdf_name))
             print(f"  ✓ {name}  {total:g}/{total_max:g}")
 
         browser.close()
@@ -1357,16 +1521,19 @@ def index():
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
-    """AJAX: 上传 Excel 文件，返回解析出的板块信息"""
+    """AJAX: 上传成绩表文件（Excel/CSV），返回解析出的板块信息"""
     if "excel" not in request.files:
-        return jsonify({"error": "请选择 Excel 文件"}), 400
+        return jsonify({"error": "请选择成绩表文件（Excel 或 CSV）"}), 400
 
     f = request.files["excel"]
     if not f.filename:
-        return jsonify({"error": "请选择 Excel 文件"}), 400
+        return jsonify({"error": "请选择成绩表文件（Excel 或 CSV）"}), 400
 
-    # 保存到临时文件
-    tmp_path = os.path.join(UPLOAD_DIR, f"upload_{datetime.now().strftime('%H%M%S')}.xlsx")
+    # 根据扩展名保存
+    ext = os.path.splitext(f.filename)[1].lower() or ".xlsx"
+    if ext not in (".xlsx", ".xls", ".csv", ".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
+        ext = ".xlsx"
+    tmp_path = os.path.join(UPLOAD_DIR, f"upload_{datetime.now().strftime('%H%M%S')}{ext}")
     f.save(tmp_path)
 
     try:
@@ -1446,10 +1613,13 @@ def preview():
     if not os.path.exists(excel_path):
         if "excel" in request.files:
             f = request.files["excel"]
-            excel_path = os.path.join(UPLOAD_DIR, f"direct_{datetime.now().strftime('%H%M%S')}.xlsx")
+            ext = os.path.splitext(f.filename)[1].lower() or ".xlsx"
+            if ext not in (".xlsx", ".xls", ".csv", ".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
+                ext = ".xlsx"
+            excel_path = os.path.join(UPLOAD_DIR, f"direct_{datetime.now().strftime('%H%M%S')}{ext}")
             f.save(excel_path)
         else:
-            return render_template("index.html", error="请先上传 Excel 文件", default_advice=load_default_advice())
+            return render_template("index.html", error="请先上传成绩表文件（Excel 或 CSV）", default_advice=load_default_advice())
 
     # 基本配置
     date_val = request.form.get("date", "auto")
@@ -1560,10 +1730,13 @@ def generate():
     if not os.path.exists(excel_path):
         if "excel" in request.files:
             f = request.files["excel"]
-            excel_path = os.path.join(UPLOAD_DIR, f"direct_{datetime.now().strftime('%H%M%S')}.xlsx")
+            ext = os.path.splitext(f.filename)[1].lower() or ".xlsx"
+            if ext not in (".xlsx", ".xls", ".csv", ".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
+                ext = ".xlsx"
+            excel_path = os.path.join(UPLOAD_DIR, f"direct_{datetime.now().strftime('%H%M%S')}{ext}")
             f.save(excel_path)
         else:
-            return render_template("index.html", error="请先上传 Excel 文件", default_advice=load_default_advice())
+            return render_template("index.html", error="请先上传成绩表文件（Excel 或 CSV）", default_advice=load_default_advice())
 
     # 基本配置
     date_val = request.form.get("date", "auto")
@@ -1668,13 +1841,21 @@ def serve_report(filename):
     return "文件不存在", 404
 
 
+@app.route("/reports_pdf/<filename>")
+def serve_report_pdf(filename):
+    path = os.path.join(OUTPUT_DIR, filename)
+    if os.path.exists(path):
+        return send_file(path, mimetype="application/pdf")
+    return "文件不存在", 404
+
+
 @app.route("/download_all")
 def download_all():
-    """打包下载所有报告"""
+    """打包下载所有报告（PNG + PDF）"""
     zip_path = os.path.join(OUTPUT_DIR, "_all_reports.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname in os.listdir(OUTPUT_DIR):
-            if fname.endswith(".png") and not fname.startswith("_"):
+            if fname.endswith((".png", ".pdf")) and not fname.startswith("_"):
                 zf.write(os.path.join(OUTPUT_DIR, fname), fname)
     return send_file(zip_path, as_attachment=True, download_name="反馈报告_全部.zip")
 
