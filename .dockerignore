@@ -1,0 +1,12 @@
+_uploads/
+反馈报告/
+*.pyc
+__pycache__/
+.DS_Store
+*.xlsx
+*.pdf
+_test_*
+一键启动.sh
+项目说明.md
+部署指南.md
+cpolar*
