@@ -43,11 +43,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def new_run_dir():
     """为每次生成创建独立目录，避免不同老师之间的报告混在一起"""
-    # 顺手清理 2 小时前的旧批次，避免云服务器磁盘被占满
+    # 顺手清理 24 小时前的旧批次，避免云服务器磁盘被占满
     now = datetime.now()
     for entry in os.listdir(OUTPUT_DIR):
         path = os.path.join(OUTPUT_DIR, entry)
-        if os.path.isdir(path) and (now - datetime.fromtimestamp(os.path.getmtime(path))) > timedelta(hours=2):
+        if os.path.isdir(path) and (now - datetime.fromtimestamp(os.path.getmtime(path))) > timedelta(hours=24):
             shutil.rmtree(path, ignore_errors=True)
     run_id = now.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     run_dir = os.path.join(OUTPUT_DIR, run_id)
