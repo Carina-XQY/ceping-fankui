@@ -443,23 +443,27 @@ SECTION_KEYWORDS = ["单项选择", "单项填空", "选择填空", "完形填�
 
 def split_pdf_by_sections(text):
     """按序号或板块标题切分试卷文本，返回 [(板块标题, 板块内容), ...]。
-    兼容：一、单项选择 / Ⅰ. 单项选择 / 第一部分 听力 / 无序号直接写板块名。
+    兼容：一、单项选择 / Ⅰ. 单项选择 / 第一部分 听力 / 无序号直接写板块名，
+    也兼容标题嵌在上一句结尾的情况（如 "...sports, from...people. V. 语法填空..."）。
     """
+    # 1) 先按"完整标题+罗马数字/中文数字"抓，允许前面是空格或句子结尾
     numbered = re.compile(
-        r'(?:^|\n)\s*(?:第\s*[一二三四五六七八九十]+\s*[部分节]|'
-        r'[一二三四五六七八九十]+\s*[、.．]|'
-        r'(?:I{1,3}|IV|V|VI{0,3}|IX|X|Ⅰ|Ⅱ|Ⅲ|Ⅳ|Ⅴ|Ⅵ|Ⅶ|Ⅷ|Ⅸ|Ⅹ)\s*[、.．])\s*([^\n]{1,40})'
+        r'(?:^|[.．!！?？；;\s])\s*'
+        r'((?:I{1,3}|IV|V|VI{0,3}|IX|X|Ⅰ|Ⅱ|Ⅲ|Ⅳ|Ⅴ|Ⅵ|Ⅶ|Ⅷ|Ⅸ|Ⅹ)'
+        r'\s*[、.．]\s*[^\n]{1,40}|'
+        r'[一二三四五六七八九十]+\s*[、.．]\s*[^\n]{1,40}|'
+        r'第\s*[一二三四五六七八九十]+\s*[部分节]\s*[^\n]{0,40})'
     )
     found = []
     for m in numbered.finditer(text):
         title = m.group(1).strip()
         # 只接受真正的板块标题，避免把选项 D. / 句子里的数字当成板块
         if canonical_section_name(title) in KNOWN_SECTIONS:
-            found.append((m.start(), title))
+            found.append((m.end(), title))  # 记录"标题结束"的位置，正文从这里开始
 
-    # 没有可用序号，或序号标题不足时，用板块关键词所在行兜底
+    # 2) 没抓到或抓得不够时，兜底用板块关键词所在行
     if len(found) < 2:
-        kw = re.compile(r'(?:^|\n)\s*((?:' + '|'.join(SECTION_KEYWORDS) + r')[^\n]{0,25})')
+        kw = re.compile(r'(?:^|\n|\s)\s*((?:' + '|'.join(SECTION_KEYWORDS) + r')[^\n]{0,25})')
         seen = set()
         for m in kw.finditer(text):
             title = m.group(1).strip()
@@ -469,16 +473,16 @@ def split_pdf_by_sections(text):
             if title.startswith(("阅读下面", "阅读短文", "阅读下列", "根据")):
                 continue
             seen.add(key)
-            found.append((m.start(), title))
+            found.append((m.end(), title))
 
     if not found:
         return [("全文", text)]
 
     found.sort(key=lambda x: x[0])
-    # 去掉同一位置重复的标题（序号行与关键词行可能重叠）
+    # 同一位置去重
     picked = []
     for pos, title in found:
-        if picked and pos <= picked[-1][0] + len(picked[-1][1]) + 2:
+        if picked and abs(pos - picked[-1][0]) <= 2:
             continue
         picked.append((pos, title))
 
@@ -486,9 +490,8 @@ def split_pdf_by_sections(text):
         return [("全文", text)]
 
     sections = []
-    for i, (pos, title) in enumerate(picked):
-        # 标题行本身可能带序号，从标题文字结束处开始取正文
-        start = text.find(title, pos) + len(title)
+    for i, (end_pos, title) in enumerate(picked):
+        start = end_pos
         end = picked[i + 1][0] if i + 1 < len(picked) else len(text)
         sections.append((title, text[start:end].strip()))
     return sections
