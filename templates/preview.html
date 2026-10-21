@@ -214,6 +214,7 @@ function submitGenerate() {
   formData.append('teacher', FORM_DATA.teacher);
   formData.append('date', FORM_DATA.date);
   formData.append('section_advice', FORM_DATA.section_advice);
+  formData.append('app_version', FORM_DATA.app_version);
   formData.append('edited_content', JSON.stringify(editedMap));
   if (LOGO_PATH) formData.append('logo_path', LOGO_PATH);
   if (MASCOT_PATH) formData.append('mascot_path', MASCOT_PATH);

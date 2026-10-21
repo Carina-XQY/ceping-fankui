@@ -8,6 +8,7 @@
 """
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -25,6 +26,9 @@ from playwright.sync_api import sync_playwright
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB max upload
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 预览页版本号：升级分析逻辑后修改，旧预览页提交时会被拒绝，避免旧内容覆盖新结果
+APP_VERSION = "2026-10-21-3"
 
 # 默认板块建议（Excel 中出现 config 里没有的板块时用）
 DEFAULT_ADVICE = {
@@ -361,13 +365,22 @@ def load_default_advice():
 #  PDF 试卷分析
 # ============================================================
 def extract_pdf_text(path):
-    """提取 PDF 全文"""
+    """提取 PDF 全文，自动识别并正确拼接双栏排版（期中/中考试卷常见）。
+    当页面宽度 > 1000pt 且明显宽于高度时，按左栏→右栏顺序拼接，
+    避免 pdfplumber 默认抽取把左右栏文字交错粘连。
+    """
     text = ""
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text()
+                w, h = page.width, page.height
+                if w > 1000 and w > h * 1.2:
+                    left = page.crop((0, 0, w * 0.52, h)).extract_text() or ''
+                    right = page.crop((w * 0.48, 0, w, h)).extract_text() or ''
+                    page_text = left + "\n" + right
+                else:
+                    page_text = page.extract_text() or ''
                 if page_text:
                     text += page_text + "\n"
     except Exception as e:
@@ -649,10 +662,10 @@ def detect_all_patterns(text):
         ("同位语", "同位语从句"), ("同位语从句", "同位语从句"),
         ("宾语从句", "宾语从句"), ("宾从", "宾语从句"),
         ("定语从句", "定语从句"), ("定从", "定语从句"),
-        ("状语从句", "状语从句"), ("状从", "状语从句"), ("时间状从", "时间状语从句"),
-        ("条件状从", "条件状语从句"), ("原因状从", "原因状语从句"),
+        ("时间状从", "时间状语从句"), ("条件状从", "条件状语从句"),
+        ("原因状从", "原因状语从句"),
         ("让步状从", "让步状语从句"), ("结果状从", "结果状语从句"),
-        ("目的状从", "目的状语从句"), ("引导的状从", "状语从句"),
+        ("目的状从", "目的状语从句"),
         ("主语从句", "主语从句"), ("表语从句", "表语从句"),
         # 特殊句式
         ("强调句", "强调句"), ("倒装句", "倒装句"),
@@ -673,126 +686,134 @@ def detect_all_patterns(text):
         ("hadbetter", "had better do"), ("had better", "had better do"),
         ("usedto", "used to do"), ("used to", "used to do"),
         ("beusedto", "be used to doing"), ("be used to", "be used to doing"),
-        # 中文结构提示
-        ("不仅...而且", "not only...but also..."), ("不仅而且", "not only...but also..."),
-        ("既不...也不", "neither...nor..."), ("既不也不", "neither...nor..."),
-        ("要么...要么", "either...or..."), ("要么要么", "either...or..."),
-        ("太...以至于", "too...to..."), ("太...以致", "too...to..."),
-        ("直到...才", "not...until..."),
-        ("如此...以致于", "so...that..."), ("如此...以至于", "so...that..."),
-        ("这样...以致于", "such...that..."), ("这样...以至于", "such...that..."),
-        ("最好", "had better do"),
-        ("过去常", "used to do"), ("过去常常", "used to do"), ("习惯于", "be used to doing"),
     ]
+    # 中文固定结构（必须用正则，避免“太棒了”“不仅”等误判）
+    cn_patterns = [
+        (r'不仅.*?而且', "not only...but also..."),
+        (r'既不.*?也', "neither...nor..."),
+        (r'要么.*?要么', "either...or..."),
+        (r'太.*?以致', "too...to... 句型"),
+        (r'直到.*?才', "not...until... 句型"),
+        (r'如此.*?以致', "so...that... 句型"),
+        (r'花费.*?时间', "It takes sb. ... to do"),
+        (r'最好', "had better do"),
+        (r'过去常', "used to do"),
+        (r'习惯于', "be used to doing"),
+    ]
+    for pat, name in cn_patterns:
+        if re.search(pat, text) and name not in found:
+            found.append(name)
     for tag, name in paper_tags:
         if tag in text or tag in text_l:
             if name not in found:
                 found.append(name)
 
-    # ====== B. 英文从句结构检测 ======
-    # 宾语从句
-    if re.search(r'\b(?:i|we|he|she|they|you)\s+(?:think|believe|hope|wonder|know|said|asked|told|heard|found|saw|realized|didn\'t know|don\'t know|want to know|understand)\b', text_l) or \
-       re.search(r'\bdo you (?:think|know|believe|realize)\b', text_l) or \
-       re.search(r'\b(?:that|if|whether|what|who|whom|whose|where|when|why|how)\b.*\b(?:think|know|said|told|asked|wonder)\b', text_l):
-        if "宾语从句" not in found:
-            found.append("宾语从句")
-    # 定语从句
-    if re.search(r'\b(?:which|who|whom|whose|that)\s+(?:is|are|was|were|has|have|will|can|do|does|did|likes|like|goes|come|said|told)\b', text_l) or \
-       re.search(r'\bthe\s+\w+\s+(?:which|who|whom|that|whose)\b', text_l) or \
-       re.search(r'\bby which\b|\bin which\b|\bfor which\b|\bwith whom\b', text_l):
-        if "定语从句" not in found:
-            found.append("定语从句")
-    # 状语从句（细分类型）
-    if re.search(r'\bbecause\b|\bsince\b.*\bbecause\b', text_l):
-        if "原因状语从句" not in found: found.append("原因状语从句")
-    if re.search(r'\bif\b|\bunless\b|\bas long as\b|\bon condition that\b', text_l):
-        if "条件状语从句" not in found: found.append("条件状语从句")
-    if re.search(r'\bthough\b|\balthough\b|\beven if\b|\beven though\b|\bwhatever\b|\bwhenever\b|\bwherever\b|\bhowever\b|\bno matter', text_l):
-        if "让步状语从句" not in found: found.append("让步状语从句")
-    if re.search(r'\bso that\b|\bin order that\b|\bto the end that\b', text_l):
-        if "目的状语从句" not in found: found.append("目的状语从句")
-    if re.search(r'\bso\s+\w+\s+that\b|\bsuch\s+\w+\s+that\b', text_l):
-        if "结果状语从句" not in found: found.append("结果状语从句")
-    if re.search(r'\bwhen\b|\bwhile\b|\bbefore\b|\bafter\b|\bas\b|\buntil\b|\btill\b|\bwhenever\b|\bsoon after\b|\bhardly.*when', text_l):
-        if "时间状语从句" not in found: found.append("时间状语从句")
-    if re.search(r'\bwhere\b|\bwherever\b', text_l) and 'the' in text_l:
-        if "地点状语从句" not in found: found.append("地点状语从句")
-    # 同位语从句（that 引导，前面常是 news/fact/idea/belief/hope）
-    if re.search(r'\b(?:news|fact|idea|belief|hope|thought|suggestion|advice|message|sign|report|truth)\s+that\b', text_l):
-        if "同位语从句" not in found:
-            found.append("同位语从句")
-    # 主语从句
-    if re.search(r'\b(?:that|what|who|whom|whose|where|when|why|how|whether)\b.*\b(?:is|are|was|were|will be|becomes|seems|looks)\b', text_l) or \
-       re.search(r'\bit\s+(?:is|was)\s+\w+\s+(?:that|what|whether)\b', text_l):
-        if "主语从句" not in found: found.append("主语从句")
-    # 表语从句
-    if re.search(r'\b(?:is|are|was|were|become|become|remain|seem|look|feel|sound)\s+(?:that|what|who|whom|whose|where|when|why|how|whether)\b', text_l):
-        if "表语从句" not in found: found.append("表语从句")
+    # ====== B. 英文从句结构检测（仅当文本里有英文句子时才扫，避免中文题干误判） ======
+    has_english = bool(re.search(r'[a-zA-Z]{3,}', text))
+    if has_english:
+        # 宾语从句
+        if re.search(r'\b(?:i|we|he|she|they|you)\s+(?:think|believe|hope|wonder|know|said|asked|told|heard|found|saw|realized|didn\'t know|don\'t know|want to know|understand)\b', text_l) or \
+           re.search(r'\bdo you (?:think|know|believe|realize)\b', text_l) or \
+           re.search(r'\b(?:that|if|whether|what|who|whom|whose|where|when|why|how)\b.*\b(?:think|know|said|told|asked|wonder)\b', text_l):
+            if "宾语从句" not in found:
+                found.append("宾语从句")
+        # 定语从句
+        if re.search(r'\b(?:which|who|whom|whose|that)\s+(?:is|are|was|were|has|have|will|can|do|does|did|likes|like|goes|come|said|told)\b', text_l) or \
+           re.search(r'\bthe\s+\w+\s+(?:which|who|whom|that|whose)\b', text_l) or \
+           re.search(r'\bby which\b|\bin which\b|\bfor which\b|\bwith whom\b', text_l):
+            if "定语从句" not in found:
+                found.append("定语从句")
+        # 状语从句（细分类型）
+        if re.search(r'\bbecause\b|\bsince\b.*\bbecause\b', text_l):
+            if "原因状语从句" not in found: found.append("原因状语从句")
+        if re.search(r'\bif\b|\bunless\b|\bas long as\b|\bon condition that\b', text_l):
+            if "条件状语从句" not in found: found.append("条件状语从句")
+        if re.search(r'\bthough\b|\balthough\b|\beven if\b|\beven though\b|\bwhatever\b|\bwherever\b|\bhowever\b|\bno matter', text_l):
+            if "让步状语从句" not in found: found.append("让步状语从句")
+        if re.search(r'\bso that\b|\bin order that\b|\bto the end that\b', text_l):
+            if "目的状语从句" not in found: found.append("目的状语从句")
+        if re.search(r'\bso\s+\w+\s+that\b|\bsuch\s+\w+\s+that\b', text_l):
+            if "结果状语从句" not in found: found.append("结果状语从句")
+        if re.search(r'\bwhen\b|\bwhile\b|\bbefore\b|\bafter\b|\bas\b|\buntil\b|\btill\b|\bwhenever\b|\bsoon after\b|\bhardly.*when', text_l):
+            if "时间状语从句" not in found: found.append("时间状语从句")
+        if re.search(r'\bwhere\b|\bwherever\b', text_l) and 'the' in text_l:
+            if "地点状语从句" not in found: found.append("地点状语从句")
+        # 同位语从句（that 引导，前面常是 news/fact/idea/belief/hope）
+        if re.search(r'\b(?:news|fact|idea|belief|hope|thought|suggestion|advice|message|sign|report|truth)\s+that\b', text_l):
+            if "同位语从句" not in found:
+                found.append("同位语从句")
+        # 主语从句
+        if re.search(r'\b(?:that|what|who|whom|whose|where|when|why|how|whether)\b.*\b(?:is|are|was|were|will be|becomes|seems|looks)\b', text_l) or \
+           re.search(r'\bit\s+(?:is|was)\s+\w+\s+(?:that|what|whether)\b', text_l):
+            if "主语从句" not in found: found.append("主语从句")
+        # 表语从句
+        if re.search(r'\b(?:is|are|was|were|become|become|remain|seem|look|feel|sound)\s+(?:that|what|who|whom|whose|where|when|why|how|whether)\b', text_l):
+            if "表语从句" not in found: found.append("表语从句")
 
-    # ====== C. 特殊句式 ======
-    # 强调句 It is/was ... that/who ...
-    if re.search(r'\bit (?:is|was|has been)\s+(?:not)?\s+\w+\s+(?:that|who|whom)\b', text_l):
-        if "强调句" not in found: found.append("强调句")
-    # 倒装句（否定词/only/not only 提前）
-    if re.search(r'\b(?:never|hardly|seldom|rarely|not only|only by|only when|only after|only then|scarcely)\b', text_l) and \
-       re.search(r'\b(?:have|has|had|did|do|does|is|are|was|were|will|can|could|should|would)\s+\w+\b', text_l):
-        if "倒装句" not in found: found.append("倒装句")
-    # 感叹句
-    if (re.search(r'\bwhat\s+(?:a|an|the)?\s+\w+', text_l) and '!' in text) or \
-       re.search(r'\bhow\s+\w+\s+!', text_l) or \
-       "多么" in text or "真" in text + "啊" in text:
-        if "感叹句" not in found: found.append("感叹句")
-    # not only...but also...
-    if re.search(r'\bnot only\b', text_l) and re.search(r'\bbut also\b|\bbut\s*\w+\s*also\b', text_l):
-        if "not only...but also..." not in found: found.append("not only...but also...")
-    # neither...nor... / either...or...
-    if re.search(r'\bneither\b.*\bnor\b', text_l):
-        if "neither...nor..." not in found: found.append("neither...nor...")
-    if re.search(r'\beither\b.*\bor\b', text_l):
-        if "either...or..." not in found: found.append("either...or...")
-    # too...to...
-    if re.search(r'\btoo\s+\w+\s+to\s+\w+', text_l):
-        if "too...to..." not in found: found.append("too...to... 句型")
-    # not...until...
-    if re.search(r'\b(?:not|never|hardly)\b.*\buntil\b', text_l) or re.search(r"\bwon\'t\b.*\buntil\b", text_l):
-        if "not...until..." not in found: found.append("not...until... 句型")
-    # so...that... / such...that...
-    if re.search(r'\bso\s+\w+\s+that\b', text_l):
-        if "so...that..." not in found: found.append("so...that... 句型")
-    if re.search(r'\bsuch\s+\w+\s+that\b', text_l):
-        if "such...that..." not in found: found.append("such...that... 句型")
-    # would rather do A than do B
-    if re.search(r'\bwould rather\s+\w+.*\bthan\b', text_l):
-        if "would rather...than..." not in found: found.append("would rather...than...")
-    # It takes sb. ... to do
-    if re.search(r'\bit takes?\s+\w+\s+(?:\w+\s+)?\w+\s+to\s+\w+', text_l):
-        if "It takes sb. ... to do" not in found: found.append("It takes sb. ... to do")
-    # 主将从现（if 条件句 + will）
-    if re.search(r'\bif\b.*\b(?:will|won\'t|shall)\b', text_l):
-        if "主将从现（if 条件句）" not in found: found.append("主将从现（if 条件句）")
-    # had better do
-    if re.search(r'\bhad better\b', text_l):
-        if "had better do" not in found: found.append("had better do")
-    # used to do / be used to doing / be used to do
-    if re.search(r'\bused to\b', text_l):
-        if "used to do / be used to" not in found: found.append("used to do / be used to")
+    # ====== C. 特殊句式（同样仅对英文句子生效） ======
+    if has_english:
+        # 强调句 It is/was ... that/who ...
+        if re.search(r'\bit (?:is|was|has been)\s+(?:not)?\s+\w+\s+(?:that|who|whom)\b', text_l):
+            if "强调句" not in found: found.append("强调句")
+        # 倒装句（否定词/only/not only 提前）
+        if re.search(r'\b(?:never|hardly|seldom|rarely|not only|only by|only when|only after|only then|scarcely)\b', text_l) and \
+           re.search(r'\b(?:have|has|had|did|do|does|is|are|was|were|will|can|could|should|would)\s+\w+\b', text_l):
+            if "倒装句" not in found: found.append("倒装句")
+        # 感叹句
+        if (re.search(r'\bwhat\s+(?:a|an|the)?\s+\w+', text_l) and '!' in text) or \
+           re.search(r'\bhow\s+\w+\s+!', text_l):
+            if "感叹句" not in found: found.append("感叹句")
+        # not only...but also...
+        if re.search(r'\bnot only\b', text_l) and re.search(r'\bbut also\b|\bbut\s*\w+\s*also\b', text_l):
+            if "not only...but also..." not in found: found.append("not only...but also...")
+        # neither...nor... / either...or...
+        if re.search(r'\bneither\b.*\bnor\b', text_l):
+            if "neither...nor..." not in found: found.append("neither...nor...")
+        if re.search(r'\beither\b.*\bor\b', text_l):
+            if "either...or..." not in found: found.append("either...or...")
+        # too...to...
+        if re.search(r'\btoo\s+\w+\s+to\s+\w+', text_l):
+            if "too...to..." not in found: found.append("too...to... 句型")
+        # not...until...
+        if re.search(r'\b(?:not|never|hardly)\b.*\buntil\b', text_l) or re.search(r"\bwon\'t\b.*\buntil\b", text_l):
+            if "not...until..." not in found: found.append("not...until... 句型")
+        # so...that... / such...that...
+        if re.search(r'\bso\s+\w+\s+that\b', text_l):
+            if "so...that..." not in found: found.append("so...that... 句型")
+        if re.search(r'\bsuch\s+\w+\s+that\b', text_l):
+            if "such...that..." not in found: found.append("such...that... 句型")
+        # would rather do A than do B
+        if re.search(r'\bwould rather\s+\w+.*\bthan\b', text_l):
+            if "would rather...than..." not in found: found.append("would rather...than...")
+        # It takes sb. ... to do
+        if re.search(r'\bit takes?\s+\w+\s+(?:\w+\s+)?\w+\s+to\s+\w+', text_l):
+            if "It takes sb. ... to do" not in found: found.append("It takes sb. ... to do")
+        # 主将从现（if 条件句 + will）
+        if re.search(r'\bif\b.*\b(?:will|won\'t|shall)\b', text_l):
+            if "主将从现（if 条件句）" not in found: found.append("主将从现（if 条件句）")
+        # had better do
+        if re.search(r'\bhad better\b', text_l):
+            if "had better do" not in found: found.append("had better do")
+        # used to do / be used to doing / be used to do
+        if re.search(r'\bused to\b', text_l):
+            if "used to do / be used to" not in found: found.append("used to do / be used to")
 
-    # ====== D. 固定搭配结构 ======
-    # one of + 复数名词
-    if re.search(r'\bone of\s+\w+s\b|\bone of\s+the\s+\w+s\b', text_l):
-        if "one of + 复数名词（最高级语境）" not in found:
-            found.append("one of + 复数名词（最高级语境）")
-    # with + n. + doing/done（伴随结构）
-    if re.search(r'\bwith\s+\w+\s+\w+(?:ing|ed|en)\b', text_l):
-        if "with 复合结构（伴随状语）" not in found:
-            found.append("with 复合结构（伴随状语）")
-    # enough to do
-    if re.search(r'\benough\s+(?:\w+\s+)?to\s+\w+', text_l):
-        if "enough...to..." not in found: found.append("enough...to... 句型")
-    # so as to / in order to
-    if re.search(r'\bso as to\b|\bin order to\b', text_l):
-        if "so as to / in order to 目的状语" not in found:
-            found.append("so as to / in order to 目的状语")
+        # ====== D. 固定搭配结构 ======
+        # one of + 复数名词
+        if re.search(r'\bone of\s+\w+s\b|\bone of\s+the\s+\w+s\b', text_l):
+            if "one of + 复数名词（最高级语境）" not in found:
+                found.append("one of + 复数名词（最高级语境）")
+        # with + n. + doing/done（伴随结构）
+        if re.search(r'\bwith\s+\w+\s+\w+(?:ing|ed|en)\b', text_l):
+            if "with 复合结构（伴随状语）" not in found:
+                found.append("with 复合结构（伴随状语）")
+        # enough to do
+        if re.search(r'\benough\s+(?:\w+\s+)?to\s+\w+', text_l):
+            if "enough...to..." not in found: found.append("enough...to... 句型")
+        # so as to / in order to
+        if re.search(r'\bso as to\b|\bin order to\b', text_l):
+            if "so as to / in order to 目的状语" not in found:
+                found.append("so as to / in order to 目的状语")
 
     return found
 
@@ -1016,8 +1037,43 @@ def first_grammar_point(text, fallback_name="词汇/短语辨析"):
     return None, ""
 
 
+def extract_question_items(text):
+    """按题号拆成 (题号, 题干)，只保留连续递增的题号序列。
+    适合翻译/语法填空等逐题分析，并自动截断答案横线和串进来的无关段落。
+    """
+    flat = re.sub(r'\s+', ' ', text or '')
+    marks = list(re.finditer(r'(?<![\d.])(\d{1,2})\s*[.．、)）]\s*', flat))
+    raw = []
+    for i, m in enumerate(marks):
+        num = int(m.group(1))
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(flat)
+        seg = flat[m.end():end]
+        # 去掉题号后紧跟的填空横线（如“4.______Tom...”），再截断末尾答案横线
+        seg = seg.lstrip(' _')
+        seg = re.split(r'_{4,}', seg)[0]
+        seg = seg.strip()[:220]
+        if len(seg) >= 5:
+            raw.append((num, seg))
+
+    # 找出最长的连续题号序列（51,52,53...），避免把年份/数字当题号
+    best, cur = [], []
+    for item in raw:
+        if cur and item[0] == cur[-1][0] + 1:
+            cur.append(item)
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = [item]
+    if len(cur) > len(best):
+        best = cur
+    return best if len(best) >= 2 else raw
+
+
 def extract_numbered_items(block_text):
     """把板块内容按题号拆成单题，便于逐题判断考点"""
+    items = extract_question_items(block_text)
+    if items:
+        return [t for _, t in items]
     flat = re.sub(r'\s+', ' ', block_text or '')
     parts = re.split(
         r'(?:^|\s)(?:[\(（]\s*[\)）]\s*)?(?:[\(（]\d{1,2}[\)）]|\d{1,2}\s*[\.．、])\s*',
@@ -1157,90 +1213,104 @@ def analyze_fill_blank_section(block_text):
 
 
 def analyze_translation_section(block_text):
-    """翻译板块 - 逐题识别句型结构，给针对性方法"""
-    items = extract_numbered_items(block_text)
-    # 整段先捞一遍
-    all_found = detect_all_patterns(block_text)
+    """翻译板块 - 逐题识别每一句的句型结构，给出逐题清单+对应做法。"""
+    # 只保留题干含中文的题（英文阅读段落混进来时自动剔除）
+    items = [(n, t) for n, t in extract_question_items(block_text)
+             if len(re.findall(r'[\u4e00-\u9fff]', t)) >= 3]
+    if not items:
+        items = [(i + 1, t) for i, t in enumerate(extract_numbered_items(block_text))]
 
-    # 逐题统计句型分布（优先用题目自带的结构标签）
-    counter = {}
-    if len(items) >= 2:
-        for it in items:
-            for pat in detect_all_patterns(it):
-                counter[pat] = counter.get(pat, 0) + 1
-        # 每题都识别不到时，退回整段检测
-        if not counter:
-            for pat in all_found:
-                counter[pat] = counter.get(pat, 0) + 1
-    else:
-        for pat in all_found:
-            counter[pat] = counter.get(pat, 0) + 1
-
-    ranked = sorted(counter.items(), key=lambda x: -x[1])
-    types = [name for name, _ in ranked]
-    type_count = len(items) if len(items) >= 2 else sum(counter.values())
-
-    # 根据识别到的句型选建议
-    clause_kinds = [t for t in types if "从句" in t or "状语" in t or "同位语" in t]
-    special_kinds = [t for t in types if t not in clause_kinds]
-
-    # 每种从句的做题要点
-    clause_tips = {
-        "宾语从句": "先判断引导词（that/if/whether/what/where/when/why/how），再保持陈述语序；",
-        "定语从句": "先找先行词，再看关系词在从句中作主语/宾语/定语（which/who/that/whose）；",
-        "时间状语从句": "注意主将从现（when/while/before/after 引导）；",
-        "条件状语从句": "if/unless 引导时注意主将从现；",
-        "原因状语从句": "because/since/as 区分语气强弱，注意和 so 不能连用；",
-        "让步状语从句": "though/although/even if 不能和 but 连用；",
-        "结果状语从句": "so + 形/副 + that / such + 名词短语 + that；",
-        "目的状语从句": "so that / in order that 引导；",
-        "同位语从句": "用 that 引导，前面常是 news/fact/idea/belief 等抽象名词；",
-        "主语从句": "that 不能省；可与 it 作形式主语互换；",
-        "表语从句": "that 不能省；注意 because/why/how 的区别；",
+    # 每个句型对应的“落笔方法”——讲具体怎么写，而不只是报一个语法名称
+    PATTERN_METHODS = {
+        "宾语从句": "主句 + 引导词(that/if/whether/what…) + 陈述语序从句，从句不能再用疑问语序",
+        "定语从句": "先行词 + 关系词(who/which/that/whose) + 缺主/宾的从句；人用 who，物用 which",
+        "时间状语从句": "when/while/before/after/as soon as + 从句，注意主将从现",
+        "条件状语从句": "if/unless + 一般现在时从句，主句用 will",
+        "原因状语从句": "because/since/as 引导原因，because 不能和 so 同时出现",
+        "让步状语从句": "though/although/even though 引导让步，不能再加 but",
+        "结果状语从句": "so + 形容词/副词 + that，或 such + 名词短语 + that",
+        "目的状语从句": "so that / in order that + 从句，从句常带 can/could",
+        "地点状语从句": "where 引导，前面不要加介词",
+        "同位语从句": "先写抽象名词(news/fact/idea/belief)，再 that + 完整句子解释其内容，从句用陈述语序",
+        "主语从句": "that 引导时不能省；长主语可用 it 作形式主语，真正主语后置",
+        "表语从句": "系动词后接 that/why/how 等引导的从句，that 不能省",
+        "强调句": "It is/was + 被强调部分 + that/who + 其余部分；去掉框架句子仍完整",
+        "倒装句": "否定词/only/not only 提前时，把助动词(do/does/did/have/is)提到主语前",
+        "感叹句": "What + a/an + 形容词 + 单数名词；How + 形容词/副词",
+        "反意疑问句": "前肯后否、前否后肯，助动词和主语与主句保持一致",
+        "not only...but also...": "not only 放句首要部分倒装；连接两个并列成分时形式要一致",
+        "neither...nor...": "neither + 助动词 + 主语 + nor + 另一主语；谓语就近一致",
+        "either...or...": "either...or... 连接并列成分，谓语就近一致",
+        "too...to... 句型": "too + 形容词/副词 + to do，to do 含否定意义，译作“太……而不能”",
+        "not...until... 句型": "not...until... 译作“直到……才”；Not until 放句首要倒装",
+        "so...that... 句型": "so + 形容词/副词 + that + 从句，结果状语",
+        "such...that... 句型": "such + a/an + 形容词 + 单数名词 + that + 从句",
+        "would rather...than...": "would rather do A than do B，前后都用动词原形",
+        "It takes sb. ... to do": "It takes sb. + 时间/精力 + to do sth.，it 是形式主语",
+        "主将从现（if 条件句）": "if 从句用一般现在时，主句用 will/won't",
+        "one of + 复数名词（最高级语境）": "one of the + 最高级 + 复数名词，谓语动词用单数",
+        "with 复合结构（伴随状语）": "with + 宾语 + doing(主动)/done(被动)/形容词/介词短语",
+        "with 伴随结构": "with + 宾语 + doing(主动)/done(被动)/形容词/介词短语，表示伴随状态",
+        "one of + 复数名词": "one of the + 最高级 + 复数名词，谓语动词用单数",
+        "enough...to... 句型": "形容词/副词 + enough + to do；enough 修饰形容词时后置",
+        "so as to / in order to 目的状语": "so as to / in order to + 动词原形，表目的",
+        "used to do / be used to": "used to do 过去常做；be used to doing 习惯于；be used to do 被用来做",
+        "had better do": "had better + 动词原形，否定用 had better not do",
     }
 
-    special_tips = {
-        "强调句": "It is/was + 被强调部分 + that/who，去掉 It is...that 仍完整；",
-        "倒装句": "否定词/only/not only 提前时助动词要提到主语前；",
-        "感叹句": "What + a/an + 单数可数名词 / How + 形/副；",
-        "not only...but also...": "就近原则（谓语看 but also 后面的主语）；",
-        "neither...nor...": "就近原则；",
-        "either...or...": "就近原则；",
-        "too...to... 句型": "表否定含义，可与 so...that...not 互换；",
-        "not...until... 句型": "注意倒装：Not until...did...；",
-        "so...that... 句型": "so + 形/副 + that；",
-        "such...that... 句型": "such + a/an + 形 + 单数名词 + that；",
-        "would rather...than...": "前后都接动词原形；",
-        "It takes sb. ... to do": "表示\"做某事花费某人多少时间\"；",
-        "主将从现（if 条件句）": "if 从句用一般现在时，主句用 will；",
-        "one of + 复数名词（最高级语境）": "one of the + 形容词最高级 + 复数名词；",
-        "with 复合结构（伴随状语）": "with + n. + doing（主动）/ done（被动）；",
-        "enough...to... 句型": "enough 修饰形容词/副词时后置；",
-        "so as to / in order to 目的状语": "后接动词原形，比 to do 更正式；",
-        "used to do / be used to": "used to do 表过去常做；be used to doing 表习惯；be used to do 表被用来做；",
-        "had better do": "表建议，后接动词原形，否定直接加 not；",
-    }
+    def _method_of(name):
+        if name in PATTERN_METHODS:
+            return PATTERN_METHODS[name]
+        for key, val in PATTERN_METHODS.items():
+            if name.startswith(key) or key.startswith(name):
+                return val
+        return ""
 
-    # 组装建议
-    topic = "复合句与特殊句式"
-    if types:
-        topic = "、".join(types[:3]) + ("等" if len(types) > 3 else "")
-    else:
-        topic = "句子翻译（基础句型）"
+    def _short_prompt(txt):
+        """截一段题干做提示，让每条建议对应到具体句子（清掉标注、英文提示和结构标签）"""
+        t = re.sub(r'[（(][^）)]{0,40}[）)]', ' ', txt)
+        t = re.sub(r'^\s*\d+\s*[.、．]?\s*', '', t)
+        t = re.sub(r'_{3,}', ' ', t)
+        t = re.sub(r'同位语从句|同位语|宾语从句|定语从句|状语从句|主语从句|表语从句|'
+                   r'宾从|定从|状从|引导的时间状从|时间状从|强调句|倒装句|感叹句|结构', ' ', t)
+        t = re.sub(r'[A-Za-z]+', ' ', t)   # 英文提示（capital/with/oneof/whenever）不是题干
+        # 丢掉孤立的注释小词（如“省会”“毛发”），只保留成句的中文
+        segs = [s for s in re.split(r'\s+', t)
+                if len(re.findall(r'[\u4e00-\u9fff]', s)) >= 3]
+        t = ''.join(segs)
+        t = t.strip('。，、；：,.;:·-—')
+        if len(re.findall(r'[\u4e00-\u9fff]', t)) < 6:
+            return ""
+        return t[:28] + ("…" if len(t) > 28 else "")
 
-    advice_parts = [f"本次共{type_count}题，句型分布："]
-    advice_parts.append("、".join(f"{name}{count}题" for name, count in ranked))
-    advice_parts.append("。下笔步骤：①先判断是什么句型（复合句/特殊句式/固定搭配）；")
-    advice_parts.append("②主句/从句分别想清楚主谓结构，注意时态一致；")
-    advice_parts.append("③写完回看英文语序（中文常先说时间地点，英文先说主谓宾）。")
+    per_q, unique = [], []
+    for num, txt in items[:10]:
+        pats = detect_all_patterns(txt)
+        # 每题最多展示 2 个结构，避免堆砌
+        pats = pats[:2] if pats else ["基础句型（主谓宾/时态）"]
+        prompt = _short_prompt(txt)
+        head = f"第{num}题"
+        if prompt:
+            head += f"（{prompt}）"
+        head += f"：{'、'.join(pats)}"
+        methods = []
+        for p in pats:
+            m = _method_of(p)
+            if m and m not in methods:
+                methods.append(m)
+            if p not in unique:
+                unique.append(p)
+        if methods:
+            head += "——" + "；".join(methods[:2])
+        per_q.append(head)
 
-    # 加分句：每种句型的针对性要点
-    if clause_kinds:
-        advice_parts.append("从句要点：" + "".join(clause_tips.get(c, "") for c in clause_kinds) + "。")
-    if special_kinds:
-        advice_parts.append("特殊句式要点：" + "".join(special_tips.get(s, "") for s in special_kinds) + "。")
+    topic = "、".join(unique[:3]) + ("等" if len(unique) > 3 else "") if unique else "句子翻译（基础句型）"
 
-    advice_parts.append("建议每天练2-3句翻译，做完对照参考答案核对句型结构。")
+    advice_parts = ["逐题考点与写法：" + "；".join(per_q) + "。"]
+    advice_parts.append("通用步骤：①圈出主干（谁+做什么）先译；②再挂修饰成分（从句/非谓语/介词短语）；"
+                        "③按英文语序落笔；④最后核对时态、主谓一致、单复数和冠词。")
+    if len(unique) >= 3:
+        advice_parts.append(f"本次共涉及 {len(unique)} 类结构，说明不能只按一种句型套，必须逐句判断。")
 
     return {"topic": topic, "advice": "".join(advice_parts)}
 
@@ -1384,6 +1454,82 @@ def analyze_cloze_section(block_text):
     return {"topic": topic, "advice": advice}
 
 
+def analyze_grammar_blanks(block_text):
+    """逐空分析语法填空：识别每空原词、词性变化和预期答案。
+    返回 [(空号, 原词, 考点, 示例答案)]。
+    """
+    flat = re.sub(r'\s+', ' ', block_text or '')
+    blanks = []
+    pat = re.compile(r'(\d{1,2})\s*[.．]?\s*_{3,}\s*(?:[\(（]\s*([A-Za-z]+)\s*[\)）])?')
+    for m in pat.finditer(flat):
+        num = int(m.group(1))
+        base = (m.group(2) or '').strip()
+        ctx = flat[max(0, m.start() - 45):m.start()]
+        ctx_l = ctx.lower().replace(' ', '')
+        b = base.lower()
+        kind, example = "词形变化", ""
+
+        if not base:
+            if re.search(r'half$|a$|an$|the$', ctx_l):
+                kind, example = "冠词", "an"
+            elif re.search(r'(?:help\w{0,3}|with|in|on|at|for|to|of|from|about|by)$', ctx_l):
+                kind, example = "介词", "with"
+            elif re.search(r'[,，;；]$', ctx) or re.search(r'(?:and|but|or|so|because|if|when|while|though)$', ctx_l):
+                kind, example = "连词", "but"
+            else:
+                kind, example = "冠词/介词/连词", ""
+        else:
+            if b in {'he', 'she', 'they', 'we', 'i'}:
+                kind = "代词宾格"
+                example = {'he': 'him', 'she': 'her', 'they': 'them', 'we': 'us', 'i': 'me'}.get(b, '')
+            elif b in {'my', 'your', 'his', 'her', 'their', 'our'}:
+                kind, example = "名词性物主代词", {'my': 'mine', 'your': 'yours', 'her': 'hers', 'our': 'ours', 'their': 'theirs'}.get(b, '')
+            elif re.search(r'(?:oneof|many|several|alotof)\w*$', ctx_l):
+                kind = "名词复数"
+                example = b + ('es' if b.endswith(('s', 'x', 'ch', 'sh')) else 's')
+            elif re.search(r'than$', ctx_l):
+                kind, example = "比较级", b + 'er'
+            elif re.search(r'(?:enjoy|finish|mind|practice|keep|avoid|suggest)', ctx_l):
+                kind, example = "非谓语 doing", b[:-1] + 'ing' if b.endswith('e') else b + 'ing'
+            elif re.search(r'(?:is|are|was|were|be|been)$', ctx_l):
+                kind = "被动/进行时"
+            elif re.search(r'to$', ctx_l):
+                kind, example = "不定式 to do", "to " + b
+            elif re.search(r'(?:something|anything|nothing|everything)$', ctx_l):
+                kind, example = "形容词后置", {'interest': 'interesting', 'excite': 'exciting',
+                                                'bore': 'boring', 'surprise': 'surprising'}.get(b, b + 'ing')
+            elif re.search(r'(?:has|have|had)$', ctx_l):
+                kind = "完成时/过去分词"
+            elif re.search(r'(?:often|usually|always|sometimes|never)$', ctx_l):
+                kind, example = "动词三单", b + ('es' if b.endswith(('s', 'x', 'ch', 'sh', 'o')) else 's')
+            elif b in {'loud', 'careful', 'quick', 'slow', 'happy', 'sudden', 'final', 'quiet',
+                       'clear', 'safe', 'easy', 'real', 'bad', 'good', 'beautiful'}:
+                kind = "副词"
+                example = {'good': 'well', 'happy': 'happily', 'easy': 'easily'}.get(b, b + 'ly')
+            elif re.search(r'(?:lastmonth|lastyear|yesterday|ago|lastweek)', flat[max(0, m.start()-80):m.start()].lower()):
+                kind = "一般过去时"
+                example = {'win': 'won', 'go': 'went', 'see': 'saw', 'buy': 'bought',
+                           'teach': 'taught', 'take': 'took'}.get(b, b + 'ed')
+            else:
+                kind = "词形变化"
+
+        blanks.append((num, base, kind, example))
+
+    # 只保留连续递增的空号（避免把年份等数字当空号）
+    blanks.sort(key=lambda x: x[0])
+    best, cur = [], []
+    for item in blanks:
+        if cur and item[0] == cur[-1][0] + 1:
+            cur.append(item)
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = [item]
+    if len(cur) > len(best):
+        best = cur
+    return best if len(best) >= 3 else blanks
+
+
 def analyze_grammar_fill_section(block_text):
     """语法填空板块 - 定词性 → 变词形
     核心做题逻辑（人教版）：
@@ -1391,6 +1537,7 @@ def analyze_grammar_fill_section(block_text):
     ②变词形——根据语境变形（时态/被动/非谓语/单复数/比较级）
     """
     forms = []
+    blanks = analyze_grammar_blanks(block_text)
     points, item_count = summarize_exam_points(block_text, limit=5, fallback_name="词形变化")
     blank_count = len(re.findall(r'_{2,}', block_text))
     if blank_count >= 3:
@@ -1411,6 +1558,26 @@ def analyze_grammar_fill_section(block_text):
     # 名词单复数
     if re.search(r'\b(?:two|three|four|five|six|seven|eight|nine|ten|many|several|some|a few|few|a lot of|lots of|plenty of)\s+\w+s\b', text_l):
         forms.append("名词单复数")
+
+    # 优先用逐空识别结果（最具体）
+    if len(blanks) >= 3:
+        counter = {}
+        per_blank = []
+        for num, base, kind, example in blanks[:12]:
+            counter[kind] = counter.get(kind, 0) + 1
+            desc = f"第{num}空"
+            if base:
+                desc += f"：{base}→{kind}" + (f"（如 {example}）" if example else "")
+            else:
+                desc += f"：{kind}" + (f"（如 {example}）" if example else "")
+            per_blank.append(desc)
+        ranked = sorted(counter.items(), key=lambda x: -x[1])
+        topic = "、".join(n for n, _ in ranked[:3]) + ("等" if len(ranked) > 3 else "")
+        advice = ("逐空考点：" + "；".join(per_blank) + "。"
+                  "做题两步走：①定词性——看空格前后缺名词/动词/形容词/副词；"
+                  "②变词形——名词看单复数，动词看时态/语态/非谓语，形容词副词看比较级。"
+                  "建议每空旁标注词性和变形理由，做完对照答案核对。")
+        return {"topic": topic, "advice": advice}
 
     # 用逐题统计的考点作为更细的分布
     detailed = "、".join(f"{name}{count}题" for name, count in points)
@@ -1657,9 +1824,15 @@ def analyze_pdf_content(text, section_names):
 
 
 def _pick_variant(name, variants):
-    """用名字 hash 从多条备选里挑一条，稳定但每个名字不同"""
-    idx = hash(name) % len(variants)
+    """用名字的稳定哈希挑一条，保证同一学生每次结果一致、不同学生各不相同"""
+    digest = hashlib.md5(str(name).encode('utf-8')).hexdigest()
+    idx = int(digest[:8], 16) % len(variants)
     return variants[idx]
+
+
+def _stable_num(text):
+    """稳定的排序扰动值，让同分板块在不同学生报告里轮换展示"""
+    return int(hashlib.md5(str(text).encode('utf-8')).hexdigest()[:8], 16)
 
 
 # —— 不同总分档的开头评语（每种 4 条备选）——
@@ -1692,12 +1865,12 @@ OPENING_WEAK = [  # < 0.55
 # —— 强项表扬（每种 3 条）——
 STRENGTH_PRAISE_FULL = [  # 板块满分
     "{section}拿到了满分，太赞了！",
-    "{section} <b>{score}/{total}</b> 拿下满分，这部分你是全班榜样！",
-    "{section}模块 <b>{score}/{total}</b> 满分通过，知识点掌握得相当扎实。",
+    "{section} <b>{score:g}/{total:g}</b> 拿下满分，这部分你是全班榜样！",
+    "{section}模块 <b>{score:g}/{total:g}</b> 满分通过，知识点掌握得相当扎实。",
 ]
 STRENGTH_PRAISE_HIGH = [  # 得分率 >= 0.8
     "{section}表现出色，只丢了 <b>{lose:g}</b> 分，值得继续保持！",
-    "{section} <b>{score}/{total}</b> 做得相当不错，这是你的优势板块！",
+    "{section} <b>{score:g}/{total:g}</b> 做得相当不错，这是你的优势板块！",
     "{section}模块得分率 {rate:.0%}，看得出来这块你花了心思。",
 ]
 STRENGTH_PRAISE_ANY = [  # 只要是 top 就说
@@ -1710,7 +1883,7 @@ STRENGTH_PRAISE_ANY = [  # 只要是 top 就说
 # —— 弱项提醒（每种 3 条）——
 WEAKNESS_REMIND_GAP = [  # 得分率 < 0.55
     "但{section}是明显短板，这次丢了 <b>{lose:g}</b> 分，需要赶紧补起来。",
-    "{section}失分较多，{score}/{total}的得分率只有 {rate:.0%}，这是当务之急要补的。",
+    "{section}失分较多，{score:g}/{total:g}的得分率只有 {rate:.0%}，这是当务之急要补的。",
     "{section}这部分基础比较薄弱，建议优先找出来多加练习。",
 ]
 WEAKNESS_REMIND_NORMAL = [  # 0.55-0.70
@@ -1760,12 +1933,11 @@ def gen_overall_eval(name, total, total_max, scores, sections, test_name):
     if not sec_details:
         return f"{name}同学本次{test_name}取得 {total:g} 分。"
 
-    # 排序
-    sec_by_rate = sorted(sec_details, key=lambda x: -x["rate"])
+    # 排序（同分板块按学生名扰动，让不同学生的优势板块展示有差异）
+    sec_by_rate = sorted(sec_details, key=lambda x: (-x["rate"], _stable_num(name + x["name"])))
     strongest = sec_by_rate[0]
     second_strongest = sec_by_rate[1] if len(sec_by_rate) >= 2 else None
     weakest = sec_by_rate[-1]
-    second_weakest = sec_by_rate[-2] if len(sec_by_rate) >= 2 else None
 
     # 1) 开头
     if rate >= 0.85:
@@ -1866,21 +2038,22 @@ ENGLISH_QUOTES = [
 
 
 def gen_teacher_msg(name, total, total_max, scores=None, sections=None, test_name="",
-                    english_quote=False):
-    """个性化班主任寄语 + 可选英语励志句。
-    scores/sections 传入时会把最弱板块点名进评语。
+                    english_quote=False, class_avg=None):
+    """个性化班主任寄语：固定包含本次分数、最强板块、最弱板块、下一步目标。
+    同一学生每次稳定，不同学生因分数/板块/姓名 hash 不同而不重复。
     """
     rate = total / total_max if total_max > 0 else 0
 
-    weakest_sec = None
+    details = []
     if scores and sections:
-        details = []
         for sec_name, max_score in sections:
             got = scores.get(sec_name, 0)
             r = got / max_score if max_score > 0 else 0
-            details.append((sec_name, r))
-        if details:
-            weakest_sec = min(details, key=lambda x: x[1])[0]
+            details.append({"name": sec_name, "score": got, "max": max_score, "rate": r})
+    details.sort(key=lambda x: (-x["rate"], _stable_num(name + x["name"])))
+    strongest = details[0] if details else None
+    weakest = details[-1] if details else None
+    weakest_sec = weakest["name"] if weakest else None
 
     if rate >= 0.75:
         msg = _pick_variant(name, TEACHER_MSG_GOOD).format(
@@ -1891,6 +2064,51 @@ def gen_teacher_msg(name, total, total_max, scores=None, sections=None, test_nam
     else:
         msg = _pick_variant(name, TEACHER_MSG_WEAK).format(
             name=name, section=weakest_sec or "基础", test_name=test_name)
+
+    # 数据句：把本次真实得分写进去，多种句式轮换，避免每份报告一个模板
+    if strongest and weakest:
+        ss = f"{strongest['score']:g}/{strongest['max']:g}"
+        ws = f"{weakest['score']:g}/{weakest['max']:g}"
+        data_tpls = [
+            "这次{sn}拿到 {ss}，是本次最稳的一块；{wn} {ws}，是接下来要重点补的地方。",
+            "从板块看，{sn} {ss} 最扎实；{wn} {ws} 还有提升空间，咱们就盯住它练。",
+            "老师注意到你{sn}拿到了 {ss}，这块保持住；{wn}只拿到 {ws}，接下来重点攻它。",
+            "这次你的{sn}很稳（{ss}），{wn}（{ws}）是下一步的突破口。",
+        ]
+        data = _pick_variant(name + "d", data_tpls).format(
+            sn=strongest["name"], ss=ss, wn=weakest["name"], ws=ws)
+
+        # 班级位置：让每个孩子看到的参照不同
+        if class_avg is not None:
+            diff = total - class_avg
+            diff_r = round(diff)
+            if diff_r >= 5:
+                cmp_tpls = [
+                    f"总分比班级平均分高 {diff_r:g} 分，已经在队伍前面了。",
+                    f"高出班级平均 {diff_r:g} 分，这个优势要继续守住。",
+                ]
+            elif diff_r <= -5:
+                cmp_tpls = [
+                    f"总分比班级平均分低 {abs(diff_r):g} 分，差距主要就在{weakest['name']}。",
+                    f"离班级平均还差 {abs(diff_r):g} 分，把{weakest['name']}补上来就能追近。",
+                ]
+            else:
+                cmp_tpls = [
+                    "总分和班级平均分基本持平，往上一步就差一个薄弱板块。",
+                    "目前处在班级平均线附近，突破点很明确。",
+                ]
+            data += _pick_variant(name + "c", cmp_tpls)
+
+        # 下一步目标
+        target = min(total_max, total + 5)
+        target_tpls = [
+            "咱们先把下一个小目标定在 {target:g} 分，一步步来。",
+            "下次先冲 {target:g} 分，老师陪你一起把这块补上。",
+            "下一个目标不高：先到 {target:g} 分，重点就练{wn}。",
+            "咱们把目标定在 {target:g} 分，主要靠{wn}多拿几分。",
+        ]
+        data += _pick_variant(name + "t", target_tpls).format(target=target, wn=weakest["name"])
+        msg = msg + " " + data
 
     quote = _pick_variant(name + "q", ENGLISH_QUOTES) if english_quote else ""
     return msg, quote
@@ -1957,7 +2175,8 @@ def get_section_color(sec_name):
 # ============================================================
 #  HTML 报告模板
 # ============================================================
-def build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64, edited=None):
+def build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64, edited=None,
+               class_avg=None):
     """生成报告 HTML。
     edited: 可选 dict，覆盖默认生成的内容。支持字段：
         overall / teacher_msg / teacher_quote / suggestions(list of [topic, advice])
@@ -1975,7 +2194,7 @@ def build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b
     suggestions = edited.get("suggestions") or gen_suggestions(scores, sections, section_advice)
     default_msg = gen_teacher_msg(name, total, total_max, scores=scores,
                                   sections=sections, test_name=test_name,
-                                  english_quote=True)
+                                  english_quote=True, class_avg=class_avg)
     t_msg = edited.get("teacher_msg") or default_msg[0]
     t_quote = edited.get("teacher_quote") or default_msg[1]
 
@@ -2114,6 +2333,7 @@ def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, 
     edited_map: 可选 {学生姓名: {overall/teacher_msg/teacher_quote/suggestions}}，覆盖默认内容。
     """
     total_max = sum(m for _, m in sections)
+    class_avg = sum(t for _, _, t in students) / len(students) if students else None
     edited_map = edited_map or {}
     generated = []
 
@@ -2126,7 +2346,8 @@ def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, 
 
         for name, scores, total in students:
             edited = edited_map.get(name, {})
-            html = build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64, edited=edited)
+            html = build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64,
+                              edited=edited, class_avg=class_avg)
 
             # 直接设置页面内容（避免中文路径问题）
             page.set_content(html, wait_until="load")
@@ -2304,12 +2525,15 @@ def preview():
 
     # 生成每位学生的文本内容（不渲染图片，只生成文字）
     total_max = sum(m for _, m in sections)
+    class_avg = sum(t for _, _, t in students) / len(students) if students else None
     student_contents = []
     for name, scores, total in students:
         overall = gen_overall_eval(name, total, total_max, scores, sections, cfg["test_name"])
         badges = gen_badges(scores, sections)
         suggestions = gen_suggestions(scores, sections, cfg["section_advice"])
-        t_msg, t_quote = gen_teacher_msg(name, total, total_max)
+        t_msg, t_quote = gen_teacher_msg(name, total, total_max, scores=scores,
+                                         sections=sections, test_name=cfg["test_name"],
+                                         english_quote=True, class_avg=class_avg)
 
         score_detail = []
         for sec_name, max_score in sections:
@@ -2344,6 +2568,7 @@ def preview():
         "teacher": cfg["teacher"],
         "date": request.form.get("date", "auto"),
         "section_advice": advice_json,
+        "app_version": APP_VERSION,
     }
 
     # 处理上传的 logo/mascot（保存为临时文件，确认生成时再读取）
@@ -2463,6 +2688,13 @@ def generate():
     # 用户编辑后的内容（来自预览页）
     edited_map = {}
     edited_json = request.form.get("edited_content", "")
+    # 预览页版本校验：旧预览页里的文本是旧逻辑生成的，提交会覆盖新分析结果
+    preview_version = request.form.get("app_version", "")
+    if edited_json and preview_version != APP_VERSION:
+        return render_template(
+            "index.html",
+            error="你打开的是旧版本预览页，里面的考点和寄语都是旧的。请重新上传成绩表和试卷 PDF，生成新的预览后再导出。",
+            default_advice=load_default_advice())
     if edited_json:
         try:
             edited_map = json.loads(edited_json)
