@@ -1403,26 +1403,30 @@ def analyze_pdf_content(text, section_names):
         if key:
             sec_text_map[key] = (sec_text_map.get(key, "") + "\n" + content).strip()
 
-    # 3. 对每个板块做针对性分析（Excel 表头先统一成标准名）
+    # 3. 对每个板块做针对性分析
+    # 兼容板块名既可以是字符串，也可以是 (名称, 满分) 元组
     whole_text_fallback = len(section_blocks) == 1 and section_blocks[0][0] == "全文"
-    for sec_name in section_names:
+    for item in section_names:
+        sec_name = item[0] if isinstance(item, tuple) else item
+        sec_label = sec_name
         key = canonical_section_name(sec_name)
         block_text = sec_text_map.get(key, "")
         if not block_text:
             if whole_text_fallback:
                 block_text = text
             else:
-                result[sec_name] = {
-                    "topic": "该板块未在试卷中定位到",
-                    "advice": "这份PDF里没有识别到该板块的题目，可能是扫描版或标题格式特殊。"
-                              "可以先手动填写考点，或换一份可复制文字的PDF再试。",
+                result[sec_label] = {
+                    "topic": "该板块未在这份试卷中出现",
+                    "advice": "这份PDF里没有识别到该板块的题目，"
+                              "可能是这次考试没考，或标题格式特殊没被识别到。"
+                              "可以先手动填写考点，或提供对应的试卷PDF再试。",
                 }
                 continue
         analyzer = SECTION_ANALYZERS.get(key) or SECTION_ANALYZERS.get(sec_name)
         if analyzer:
-            result[sec_name] = analyzer(block_text)
+            result[sec_label] = analyzer(block_text)
         else:
-            result[sec_name] = analyze_generic_section(block_text, sec_name)
+            result[sec_label] = analyze_generic_section(block_text, sec_name)
 
     return result
 
