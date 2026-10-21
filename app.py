@@ -436,9 +436,16 @@ DOING_VERBS = ["enjoy", "finish", "practice", "practise", "mind", "avoid", "cons
                "appreciate", "tolerate", "resist", "spend"]
 
 
-SECTION_KEYWORDS = ["单项选择", "单项填空", "选择填空", "完形填空", "语法填空",
-                    "适当形式填空", "任务型阅读", "六选五", "七选五", "阅读理解",
-                    "阅读", "完成句子", "书面表达", "作文", "单词", "短语", "翻译"]
+SECTION_KEYWORDS = [
+    # 中文
+    "单项选择", "单项填空", "选择填空", "完形填空", "语法填空",
+    "适当形式填空", "任务型阅读", "六选五", "七选五", "阅读理解",
+    "阅读", "完成句子", "书面表达", "作文", "单词", "短语", "翻译",
+    "听力", "选词填空", "还原句子",
+    # 英文（不分大小写，canonical_section_name 会统一处理）
+    "multiple choice", "cloze test", "grammar fill", "grammar sort",
+    "reading", "writing", "composition", "translation", "listening",
+]
 
 
 def split_pdf_by_sections(text):
@@ -461,9 +468,10 @@ def split_pdf_by_sections(text):
         if canonical_section_name(title) in KNOWN_SECTIONS:
             found.append((m.end(), title))  # 记录"标题结束"的位置，正文从这里开始
 
-    # 2) 没抓到或抓得不够时，兜底用板块关键词所在行
+    # 2) 没抓到或抓得不够时，兜底用板块关键词所在行（支持中英文、不区分大小写）
     if len(found) < 2:
-        kw = re.compile(r'(?:^|\n|\s)\s*((?:' + '|'.join(SECTION_KEYWORDS) + r')[^\n]{0,25})')
+        kw = re.compile(r'(?:^|\n|\s)\s*((?:' + '|'.join(re.escape(k) for k in SECTION_KEYWORDS) + r')[^\n]{0,25})',
+                        re.IGNORECASE)
         seen = set()
         for m in kw.finditer(text):
             title = m.group(1).strip()
@@ -503,14 +511,36 @@ KNOWN_SECTIONS = {'单选', '语法填空', '完形', '填空', '翻译', '六�
 
 def canonical_section_name(name):
     """把 Excel 表头 / 试卷标题统一成标准板块名。
-    例如：单项选择→单选、适当形式填空→填空、完成句子→翻译、书面表达→作文。
+    支持中文 + 英文标签，例如 Multiple Choice/单项选择 -> 单选。
     """
-    t = re.sub(r'[\(（\[【].*?[\)）\]】]', '', str(name or ''))
+    raw = str(name or '')
+    t = re.sub(r'[\(（\[【].*?[\)）\]】]', '', raw)
     t = re.sub(r'\s+', '', t).strip()
     if not t:
         return ''
-    # 顺序很重要：先判断特殊板块，再判断大类
-    if any(k in t for k in ["单项选择", "单选", "选择填空"]):
+
+    # ===== 英文别名（大小写不敏感） =====
+    # 先去掉开头的罗马/中文数字序号，避免 "III. Reading" 匹配不上
+    body = re.sub(r'^[IVXLCDMivxlcdmⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ一二三四五六七八九十]+\s*[、.．]\s*', '', t)
+    t_clean = re.sub(r'[\s\-]+', '', body.lower())
+    # 单选：Multiple Choice / Multiple-choice / Part I Multiple Choice
+    if any(k in t_clean for k in ["multiplechoice", "partimultiplechoice"]):
+        return "单选"
+    if "grammarsort" in t_clean or "grammarfill" in t_clean or "gramfill" in t_clean:
+        return "语法填空"
+    if "clozetest" in t_clean or t_clean == "cloze":
+        return "完形"
+    if t_clean in {"reading", "read"} or "partivreading" in t_clean or "part4reading" in t_clean:
+        return "阅读"
+    if t_clean in {"translate", "translation"} or "partvi" in t_clean or "part6translate" in t_clean:
+        return "翻译"
+    if t_clean in {"writing", "composition", "essay"} or "partvii" in t_clean or "part7writing" in t_clean:
+        return "作文"
+    if t_clean == "listening" or "partilistening" in t_clean:
+        return "听力"
+
+    # ===== 中文别名（顺序很重要：先特殊板块，后大类） =====
+    if any(k in t for k in ["单项选择", "选择填空", "选择题"]):
         return "单选"
     if "语法填空" in t:
         return "语法填空"
@@ -518,7 +548,7 @@ def canonical_section_name(name):
         return "完形"
     if "任务型" in t:
         return "任务型阅读"
-    if any(k in t for k in ["六选五", "七选五", "五选五", "5选5", "6选5", "7选5"]):
+    if any(k in t for k in ["六选五", "七选五", "五选五", "5选5", "6选5", "7选5", "还原句子", "选词填空"]):
         return "六选五"
     if any(k in t for k in ["适当形式", "词形变化", "词形转换", "变形填空"]):
         return "填空"
