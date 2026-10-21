@@ -12,8 +12,10 @@ import io
 import json
 import os
 import re
+import shutil
+import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import openpyxl
 from flask import Flask, render_template, request, jsonify, send_file
@@ -37,6 +39,20 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # 报告输出目录
 OUTPUT_DIR = os.path.join(BASE_DIR, "反馈报告")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def new_run_dir():
+    """为每次生成创建独立目录，避免不同老师之间的报告混在一起"""
+    # 顺手清理 2 小时前的旧批次，避免云服务器磁盘被占满
+    now = datetime.now()
+    for entry in os.listdir(OUTPUT_DIR):
+        path = os.path.join(OUTPUT_DIR, entry)
+        if os.path.isdir(path) and (now - datetime.fromtimestamp(os.path.getmtime(path))) > timedelta(hours=2):
+            shutil.rmtree(path, ignore_errors=True)
+    run_id = now.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    run_dir = os.path.join(OUTPUT_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_id, run_dir
 
 
 # ============================================================
@@ -420,46 +436,92 @@ DOING_VERBS = ["enjoy", "finish", "practice", "practise", "mind", "avoid", "cons
                "appreciate", "tolerate", "resist", "spend"]
 
 
+SECTION_KEYWORDS = ["单项选择", "单项填空", "选择填空", "完形填空", "语法填空",
+                    "适当形式填空", "任务型阅读", "六选五", "七选五", "阅读理解",
+                    "阅读", "完成句子", "书面表达", "作文", "单词", "短语", "翻译"]
+
+
 def split_pdf_by_sections(text):
-    """按罗马数字/中文数字切分试卷文本，返回 [(板块标题, 板块内容), ...]"""
-    pattern = re.compile(
-        r'(?:^|\n)\s*([IVXLCDM]{1,5}|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|[一二三四五六七八九十]+)[\.、．]\s*([^\n]+)'
+    """按序号或板块标题切分试卷文本，返回 [(板块标题, 板块内容), ...]。
+    兼容：一、单项选择 / Ⅰ. 单项选择 / 第一部分 听力 / 无序号直接写板块名。
+    """
+    numbered = re.compile(
+        r'(?:^|\n)\s*(?:第\s*[一二三四五六七八九十]+\s*[部分节]|'
+        r'[一二三四五六七八九十]+\s*[、.．]|'
+        r'(?:I{1,3}|IV|V|VI{0,3}|IX|X|Ⅰ|Ⅱ|Ⅲ|Ⅳ|Ⅴ|Ⅵ|Ⅶ|Ⅷ|Ⅸ|Ⅹ)\s*[、.．])\s*([^\n]{1,40})'
     )
-    matches = list(pattern.finditer(text))
-    if not matches:
+    found = []
+    for m in numbered.finditer(text):
+        title = m.group(1).strip()
+        # 只接受真正的板块标题，避免把选项 D. / 句子里的数字当成板块
+        if canonical_section_name(title) in KNOWN_SECTIONS:
+            found.append((m.start(), title))
+
+    # 没有可用序号，或序号标题不足时，用板块关键词所在行兜底
+    if len(found) < 2:
+        kw = re.compile(r'(?:^|\n)\s*((?:' + '|'.join(SECTION_KEYWORDS) + r')[^\n]{0,25})')
+        seen = set()
+        for m in kw.finditer(text):
+            title = m.group(1).strip()
+            key = canonical_section_name(title)
+            if key not in KNOWN_SECTIONS or key in seen:
+                continue
+            if title.startswith(("阅读下面", "阅读短文", "阅读下列", "根据")):
+                continue
+            seen.add(key)
+            found.append((m.start(), title))
+
+    if not found:
         return [("全文", text)]
+
+    found.sort(key=lambda x: x[0])
+    # 去掉同一位置重复的标题（序号行与关键词行可能重叠）
+    picked = []
+    for pos, title in found:
+        if picked and pos <= picked[-1][0] + len(picked[-1][1]) + 2:
+            continue
+        picked.append((pos, title))
+
+    if len(picked) < 2:
+        return [("全文", text)]
+
     sections = []
-    for i, m in enumerate(matches):
-        title = m.group(2).strip()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        content = text[start:end].strip()
-        sections.append((title, content))
+    for i, (pos, title) in enumerate(picked):
+        # 标题行本身可能带序号，从标题文字结束处开始取正文
+        start = text.find(title, pos) + len(title)
+        end = picked[i + 1][0] if i + 1 < len(picked) else len(text)
+        sections.append((title, text[start:end].strip()))
     return sections
 
 
-def map_to_section_key(title, content=""):
-    """把试卷板块标题映射到 Excel 中的板块名"""
-    t = title
-    if any(k in t for k in ["单项选择", "单选"]):
+KNOWN_SECTIONS = {'单选', '语法填空', '完形', '填空', '翻译', '六选五',
+                  '任务型阅读', '阅读', '作文', '短语', '单词', '听力'}
+
+
+def canonical_section_name(name):
+    """把 Excel 表头 / 试卷标题统一成标准板块名。
+    例如：单项选择→单选、适当形式填空→填空、完成句子→翻译、书面表达→作文。
+    """
+    t = re.sub(r'[\(（\[【].*?[\)）\]】]', '', str(name or ''))
+    t = re.sub(r'\s+', '', t).strip()
+    if not t:
+        return ''
+    # 顺序很重要：先判断特殊板块，再判断大类
+    if any(k in t for k in ["单项选择", "单选", "选择填空"]):
         return "单选"
-    # 语法填空必须在填空之前检测，否则会被"填空"匹配
     if "语法填空" in t:
         return "语法填空"
-    # 完形填空必须在填空之前检测，否则会被"填空"匹配
-    if any(k in t for k in ["完形"]):
+    if "完形" in t:
         return "完形"
-    if any(k in t for k in ["填空"]):
-        return "填空"
-    if any(k in t for k in ["翻译"]):
-        return "翻译"
-    # 六选五/七选五/五选五
+    if "任务型" in t:
+        return "任务型阅读"
     if any(k in t for k in ["六选五", "七选五", "五选五", "5选5", "6选5", "7选5"]):
         return "六选五"
-    # 任务型阅读必须在阅读之前检测
-    if "任务型" in t and "阅读" in t:
-        return "任务型阅读"
-    if any(k in t for k in ["阅读"]):
+    if any(k in t for k in ["适当形式", "词形变化", "词形转换", "变形填空"]):
+        return "填空"
+    if any(k in t for k in ["完成句子", "翻译", "汉译英", "英译汉", "互译"]):
+        return "翻译"
+    if "阅读" in t:
         return "阅读"
     if any(k in t for k in ["作文", "书面表达", "写作"]):
         return "作文"
@@ -467,13 +529,17 @@ def map_to_section_key(title, content=""):
         return "短语"
     if any(k in t for k in ["单词", "词汇"]):
         return "单词"
-    # 英汉互译：根据内容判断单词还是短语
-    if "互译" in t:
-        if re.search(r'\b(?:n|v|adj|adv|prep|conj)\.', content):
-            return "单词"
-        if re.search(r'\b\w+\s+\w+', content):
-            return "短语"
-    return None
+    if "听力" in t:
+        return "听力"
+    if "填空" in t:
+        return "填空"
+    return t
+
+
+def map_to_section_key(title, content=""):
+    """把试卷板块标题映射到 Excel 中的板块名（返回标准名，未识别返回 None）"""
+    key = canonical_section_name(title)
+    return key if key in KNOWN_SECTIONS else None
 
 
 def detect_tenses(text):
@@ -633,6 +699,218 @@ def detect_comparisons(text):
     return found
 
 
+# ============================================================
+#  人教版 7-9 年级核心考点规则库
+#  每条： (考点名, [正则], 做题提示)
+#  顺序：先具体后笼统，避免"一般过去时"吞掉所有考点
+# ============================================================
+PAST_PARTICIPLES = (r'been|done|gone|written|taken|given|known|seen|shown|driven|grown|'
+                    r'flown|fallen|broken|chosen|spoken|stolen|woken|ridden|risen|beaten|'
+                    r'eaten|forgotten|hidden|forbidden|built|bought|brought|caught|taught|'
+                    r'thought|fought|sought|made|paid|sent|spent|lost|won|found|left|kept|'
+                    r'heard|felt|meant|met|read|run|come|become|begun|drunk|swum')
+
+GRAMMAR_POINT_RULES = [
+    ("现在完成时", [
+        rf'\b(?:have|has)\s+(?:{PAST_PARTICIPLES})\b',
+        r'\b(?:already|yet|ever|never|just)\b',
+        r'\bsince\s+(?:\w+|\d{4})\b',
+        r'\bfor\s+(?:a|an|two|three|several|\d+)\s+\w+',
+        r'\bso far\b|\bin the past\b|\brecently\b',
+    ], "抓 have/has + 过去分词；圈 already/yet/since/for 等标志词"),
+    ("过去完成时", [
+        rf'\bhad\s+(?:{PAST_PARTICIPLES})\b',
+        r'\bby the time\b|\bby the end of\b',
+    ], "抓 had + 过去分词；by the time / by the end of 是强提示"),
+    ("过去进行时", [
+        r'\b(?:was|were)\s+\w+ing\b',
+        r'\b(?:at that time|at this time yesterday|while)\b',
+    ], "抓 was/were + doing；while/at that time 提示背景动作"),
+    ("现在进行时", [
+        r'\b(?:am|is|are)\s+\w+ing\b',
+        r'\b(?:now|look|listen|at the moment)\b',
+    ], "抓 am/is/are + doing；now/Look/Listen 是标志词"),
+    ("一般将来时", [
+        r'\b(?:will|shall)\s+\w+',
+        r'\bbe going to\s+\w+',
+        r'\b(?:tomorrow|next\s+(?:week|month|year|Monday)|soon|in the future)\b',
+    ], "抓 will / be going to；注意 tomorrow/next week 等将来标志"),
+    ("一般过去时", [
+        r'\b(?:yesterday|last\s+(?:week|month|year|night|weekend)|just now|ago|in \d{4})\b',
+        r'\b(?:went|came|took|gave|saw|made|said|told|found|got|bought|thought|knew|'
+        r'grew|flew|drove|rode|spoke|broke|chose|wrote|fell|ate|forgot|spent|sent|'
+        r'lent|built|meant|paid|stood|understood|held|sold|won|shot|lost|kept|left)\b',
+    ], "抓 yesterday/last.../ago 等过去时间；动词用过去式"),
+    ("一般现在时", [
+        r'\b(?:always|usually|often|sometimes|never|every\s+(?:day|week|year|morning))\b',
+        r'\b(?:do|does)\s+\w+',
+    ], "抓 always/usually/every day；主语三单时动词加 s/es"),
+    ("被动语态", [
+        r'\b(?:am|is|are|was|were|be|been|being)\s+(?:not\s+)?\w+(?:ed|en)\b',
+        r'\b(?:must|can|should|may|might|could)\s+be\s+\w+(?:ed|en)\b',
+        r'\b(?:have|has|had)\s+been\s+\w+(?:ed|en)\b',
+        r'\bwill\s+be\s+\w+(?:ed|en)\b',
+    ], "先判断主语是动作承受者，再用 be + 过去分词，注意时态一致"),
+    ("非谓语动词", [
+        r'\bto\s+(?:do|be|learn|study|finish|get|go|come|know|see|help|keep|'
+        r'remember|forget|decide|want|hope|refuse|agree|ask|tell|advise|encourage|'
+        r'invite|expect|promise|plan|choose|afford|offer|manage|pretend|fail|'
+        r'happen|seem|appear|wish|improve|close|complete|realize|reach)\b',
+        r'\b(?:enjoy|finish|practice|mind|avoid|consider|suggest|keep|imagine|'
+        r'miss|give up|look forward to|be busy|feel like|can\'t help)\s+\w+ing\b',
+        r'\b(?:is|are|was|were|be|been|feel|felt|look|looked|seem|seemed|become|became)\s+\w+(?:ed|en)\b',
+    ], "看空格前后结构：目的/将来用 to do，介词后/习惯搭配用 doing，被动/完成用 done"),
+    ("宾语从句", [
+        r'\b(?:think|believe|hope|wonder|know|say|said|ask|asked|tell|told|'
+        r'find|found|guess|remember|forget)\s+(?:that|if|whether|what|where|when|why|how|who)\b',
+        r'\bdo you (?:think|know|believe)\b',
+        r'\bcould you tell me\b',
+    ], "注意引导词（that/if/whether/疑问词）和陈述语序，不能再用疑问语序"),
+    ("定语从句", [
+        r'\b(?:which|who|whom|whose|that)\s+(?:is|are|was|were|has|have|will|can|do|does|did|likes|like)\b',
+        r'\bthe\s+(?:\w+\s+){0,2}(?:which|who|whom|that|whose)\b',
+    ], "先找先行词，再看关系词在从句中作主语/宾语/定语"),
+    ("状语从句", [
+        r'\b(?:because|although|though|since|unless|as long as|so that|in order that|'
+        r'even if|as soon as|while|when|before|after)\b',
+        r'\bso\s+\w+\s+that\b|\bsuch\s+\w+\s+that\b',
+    ], "判断是时间/原因/条件/让步/结果状语从句，再选引导词"),
+    ("情态动词", [
+        r'\b(?:can|could|may|might|must|should|need|have to|has to)\s+\w+',
+        r'\bmustn\'t\b|\bdon\'t have to\b|\bhad better\b',
+    ], "区分 must（必须/肯定推测）与 can't（否定推测）；注意后接动词原形"),
+    ("比较级与最高级", [
+        r'\b\w+er\s+than\b|\bmore\s+\w+\s+than\b',
+        r'\bthe\s+\w+est\b|\bthe most\s+\w+\b',
+        r'\bas\s+\w+\s+as\b|\bless\s+\w+\s+than\b',
+    ], "than 前用比较级，the + 范围用最高级，as...as 中间用原级"),
+    ("名词单复数", [
+        r'\b(?:two|three|four|five|six|seven|eight|nine|ten|many|several|few|'
+        r'a few|some|lots of|a lot of|plenty of)\s+\w+s\b',
+        r'\b(?:hundreds of|thousands of|millions of)\b',
+    ], "数字/many/some 后接可数名词复数；注意不规则复数"),
+    ("代词", [
+        r'\b(?:someone|somebody|anyone|anybody|everyone|everybody|nobody|'
+        r'something|anything|everything|nothing)\b',
+        r'\b(?:both|either|neither|none|other|another|others|the other)\b',
+        r'\b(?:myself|yourself|himself|herself|itself|ourselves|yourselves|themselves)\b',
+    ], "不定代词看范围（both/either/neither/none）；反身代词看主语一致"),
+    ("冠词", [
+        r'\b(?:a|an)\s+\w+',
+        r'\bthe\s+\w+',
+        r'\b(?:play|playing)\s+the\s+\w+',
+    ], "元音音素前用 an；特指/独一无二/序数词前用 the；泛指用 a/an"),
+    ("介词与介词短语", [
+        r'\b(?:in|on|at|by|with|for|from|about|of|to|into|across|through|during|'
+        r'without|after|before|between|among)\s+(?:the|a|an|my|his|her|their|our|your|\w+ing)\b',
+        r'\b(?:be interested in|be good at|be afraid of|be proud of|be famous for|'
+        r'be strict with|be full of|be made of|be made from)\b',
+    ], "记固定搭配：in the morning / on Monday / at night；形容词+介词要成组记"),
+    ("连词", [
+        r'\b(?:both|either|neither|not only)\s+\w+\s+(?:and|or|nor|but)\b',
+        r'\b(?:and|but|or|so|because|although|while)\b',
+    ], "看前后逻辑：并列/转折/选择/因果，再选连词"),
+    ("主谓一致", [
+        r'\b(?:one of|each of|every one of|the number of)\b',
+        r'\b(?:each|every|either|neither|nobody|everybody|somebody)\b',
+    ], "one of + 复数名词作主语，谓语用单数；the number of 用单数，a number of 用复数"),
+    ("特殊句式", [
+        r'\bwhat\s+(?:a|an)\s+\w+|\bhow\s+\w+\s+!',
+        r'\bit (?:is|was)\s+\w+\s+(?:that|who)\b',
+        r'\b(?:never|hardly|seldom|not only|only when|only after)\b',
+        r'\btoo\s+\w+\s+to\b|\bnot\s+\w+\s+until\b|\bit takes?\b',
+    ], "感叹句看 what/how；强调句看 It is/was...that；倒装看否定词提前"),
+    ("动词短语与固定搭配", [
+        r'\b(?:look|take|give|come|get|put|turn|keep|go|set|make|bring|call|'
+        r'pick|show|work|hand|break|find|deal|depend|belong|stick|lead|refer)\s+'
+        r'(?:up|down|on|off|out|in|away|back|over|through|to|for|with|about|after)\b',
+        r'\b(?:be used to|used to|look forward to|pay attention to|make a difference)\b',
+    ], "动词短语按核心动词归类记忆，注意 up/off/out 等小品词改变词义"),
+    ("情景交际", [
+        r'\b(?:would you like|why not|how about|what about|shall we|'
+        r'i\'d love to|sounds good|no problem|never mind|with pleasure)\b',
+    ], "先判断语境（邀请/建议/道歉/感谢），再选符合英语习惯的答语"),
+]
+
+
+def detect_grammar_points(text, limit=None):
+    """按规则库统计考点，返回 [{'name', 'count', 'tip'}]，按命中次数排序"""
+    text_l = (text or '').lower()
+    scored = []
+    for name, patterns, tip in GRAMMAR_POINT_RULES:
+        hits = 0
+        for p in patterns:
+            hits += len(re.findall(p, text_l, re.IGNORECASE))
+        if hits:
+            scored.append({"name": name, "count": hits, "tip": tip})
+    scored.sort(key=lambda x: -x["count"])
+    return scored[:limit] if limit else scored
+
+
+NOISY_POINTS = {"冠词", "介词与介词短语", "连词", "代词", "名词单复数", "一般现在时"}
+
+
+def first_grammar_point(text, fallback_name="词汇/短语辨析"):
+    """逐题判断主考点：按规则库顺序取第一个明确考点，跳过过于宽泛的词法项"""
+    text_l = (text or '').lower()
+    fallback = None
+    for name, patterns, tip in GRAMMAR_POINT_RULES:
+        if any(re.search(p, text_l, re.IGNORECASE) for p in patterns):
+            if fallback is None:
+                fallback = (name, tip)
+            if name not in NOISY_POINTS:
+                return name, tip
+    if fallback_name:
+        return fallback_name, "先看选项的词性和搭配差异，再用代入法排除"
+    if fallback:
+        return fallback
+    return None, ""
+
+
+def extract_numbered_items(block_text):
+    """把板块内容按题号拆成单题，便于逐题判断考点"""
+    flat = re.sub(r'\s+', ' ', block_text or '')
+    parts = re.split(
+        r'(?:^|\s)(?:[\(（]\s*[\)）]\s*)?(?:[\(（]\d{1,2}[\)）]|\d{1,2}\s*[\.．、])\s*',
+        flat
+    )
+    return [p.strip() for p in parts if len(p.strip()) >= 6]
+
+
+def summarize_exam_points(block_text, limit=5, fallback_name="词汇/短语辨析"):
+    """逐题统计主考点，返回 ([(考点, 题数)], 题目数)"""
+    items = extract_numbered_items(block_text)
+    counter = {}
+    if len(items) >= 3:
+        for item in items:
+            name, _ = first_grammar_point(item, fallback_name=fallback_name)
+            if name:
+                counter[name] = counter.get(name, 0) + 1
+        if not counter:
+            # 题目里没有明显语法特征时，退回整段检测
+            for p in detect_grammar_points(block_text, limit=limit):
+                counter[p["name"]] = p["count"]
+        ranked = sorted(counter.items(), key=lambda x: -x[1])[:limit]
+        return ranked, len(items)
+    ranked = [(p["name"], p["count"]) for p in detect_grammar_points(block_text, limit=limit)]
+    return ranked, len(items)
+
+
+def build_points_advice(points, item_count, base_tip=""):
+    """把考点分布拼成一句老师能直接用的分析"""
+    if not points:
+        return ""
+    dist = "、".join(f"{name}{count}题" for name, count in points)
+    tips = []
+    for name, _ in points[:3]:
+        for rule_name, _, tip in GRAMMAR_POINT_RULES:
+            if rule_name == name and tip not in tips:
+                tips.append(tip)
+                break
+    prefix = f"本次共{item_count}题，考点分布：{dist}。" if item_count >= 3 else f"本次主要涉及：{dist}。"
+    return prefix + (base_tip or "") + ("重点方法：" + "；".join(tips) + "。" if tips else "")
+
+
 def analyze_vocab_section(block_text):
     """单词板块分析"""
     pos_tags = re.findall(r'\b(?:n|v|adj|adv|prep|conj|num|art|pron|int)\.', block_text)
@@ -679,118 +957,53 @@ def analyze_phrases_section(block_text):
 
 
 def analyze_choice_section(block_text):
-    """单选板块 - 主要考时态、语态、从句、词法"""
-    tenses = detect_tenses(block_text)
-    passives = detect_passive_voice(block_text)
-    clauses = detect_clauses(block_text)
-    specials = detect_special_sentences(block_text)
-    modals = detect_modal_verbs(block_text)
-    comparisons = detect_comparisons(block_text)
-
-    all_points = []
-    if tenses:
-        all_points.extend(tenses)
-    if passives:
-        all_points.append("被动语态")
-    if clauses:
-        all_points.extend(clauses)
-    if specials:
-        all_points.extend(specials)
-    if modals:
-        all_points.append("情态动词")
-    if comparisons:
-        all_points.extend(comparisons)
-
-    if not all_points:
-        topic = "语法综合"
-        advice = ("做题时先判断考点（时态/语态/从句/介词），再选最佳答案。"
-                  "建议每天练5道单选，做完后核对考点并归纳错题。")
+    """单选板块 - 逐题识别考点并统计分布"""
+    points, item_count = summarize_exam_points(block_text, limit=5)
+    if points:
+        topic = "、".join(name for name, _ in points[:3]) + ("等" if len(points) > 3 else "")
+        dist = "、".join(f"{name}{count}题" for name, count in points)
+        tips = []
+        for name, _ in points[:3]:
+            for rule_name, _, tip in GRAMMAR_POINT_RULES:
+                if rule_name == name:
+                    tips.append(tip)
+                    break
+        advice = ((f"本次共{item_count}题，" if item_count >= 3 else "本次主要涉及")
+                  + f"考点分布：{dist}。"
+                  "做题四步：①圈题干里的时间、搭配、逻辑关键词；"
+                  "②判断考什么（时态/语态/从句/词法）；③排除明显错误选项；"
+                  "④把错题按考点归类。")
+        if tips:
+            advice += "重点方法：" + "；".join(tips) + "。"
+        advice += "建议每天练5道，做完核对考点并归纳错题。"
         return {"topic": topic, "advice": advice}
 
-    extras = ""
-    if passives:
-        extras += "被动语态要特别注意时态搭配。"
-    if clauses:
-        extras += "从句要判断类型再选引导词。"
-    if modals:
-        extras += "情态动词注意表推测/表必要的用法区分。"
-
-    if tenses and len(tenses) >= 2:
-        topic = "时态综合判断"
-        advice = (f"做题养成「先找时间标志词，再判断时态」的习惯。本次重点考{'、'.join(tenses)}。"
-                  + extras +
-                  "建议每天练5道，做完后归纳错题考点。")
-    elif tenses:
-        topic = f"{tenses[0]}判断"
-        advice = (f"做题先找时间标志词（already/yet/by the time/last year/next week等），"
-                  f"再判断时态。本次重点考{'、'.join(tenses)}。" + extras +
-                  "建议每天练5道，做完后归纳错题考点。")
-    elif passives:
-        topic = "被动语态"
-        advice = (f"做题先判断主动/被动（主语是动作执行者还是承受者），"
-                  f"再选时态搭配（{'、'.join(passives)}）。建议每天练5道，归纳错题考点。")
-    elif clauses:
-        topic = "从句运用"
-        advice = (f"做题先判断从句类型（{'、'.join(clauses)}），再选正确引导词。"
-                  + extras + "建议每天练5道，归纳错题考点。")
-    elif specials:
-        topic = "特殊句式"
-        advice = (f"本次涉及{'、'.join(specials)}，掌握句式结构是关键。" + extras +
-                  "建议每天练5道，归纳错题考点。")
-    elif comparisons:
-        topic = "比较等级"
-        advice = (f"本次涉及{'、'.join(comparisons)}，注意比较级/最高级/同级比较的搭配。"
-                  "建议每天练5道。")
-    else:
-        topic = "语法综合"
-        advice = ("做题时先判断考点（时态/语态/从句/介词），再选最佳答案。"
-                  "建议每天练5道，归纳错题考点。")
-
+    topic = "语法综合"
+    advice = ("做题时先判断考点（时态/语态/从句/介词），再选最佳答案。"
+              "建议每天练5道单选，做完后核对考点并归纳错题。")
     return {"topic": topic, "advice": advice}
 
 
 def analyze_fill_blank_section(block_text):
-    """填空板块 - 主要考非谓语+被动"""
+    """填空板块 - 逐题识别词形变化考点"""
+    points, item_count = summarize_exam_points(block_text, limit=5, fallback_name="词形变化")
+    blank_count = len(re.findall(r'_{2,}', block_text))
+    if blank_count >= 3:
+        item_count = blank_count
     nonfinites = detect_nonfinite(block_text)
     passives = detect_passive_voice(block_text)
 
-    all_points = []
-    if nonfinites:
-        all_points.extend(nonfinites)
-    if passives:
-        all_points.append("被动语态")
+    labels = [name for name, _ in points]
+    if not labels:
+        labels = (nonfinites or []) + (["被动语态"] if passives else [])
+    topic = "、".join(labels[:3]) + ("等" if len(labels) > 3 else "") if labels else "词形变化"
 
-    if not all_points:
-        topic = "动词形式变化"
-        advice = ("做题时先判断主动/被动，再根据动词前后结构判断用 doing / to do / done，"
-                  "建议每天练3道填空专项。")
-        return {"topic": topic, "advice": advice}
-
-    has_passive = "被动语态" in all_points
-    has_nonfinite = bool(nonfinites)
-
-    if has_passive and has_nonfinite:
-        topic = "非谓语动词+被动语态"
-        passive_str = "（" + "、".join(passives) + "）" if passives else ""
-        advice = (f"做题时先判断主动/被动，再判断动词形式（doing / to do / done）。"
-                  f"本次涉及{'、'.join(nonfinites)}与被动语态{passive_str}。"
-                  "被动语态注意时态搭配（be + 过去分词），非谓语注意前后结构。"
-                  "建议每天练3道填空专项。")
-    elif has_passive:
-        topic = "被动语态"
-        passive_str = "、".join(passives) if passives else "be + 过去分词"
-        advice = (f"做题先判断主动/被动（主语是动作执行者还是承受者），"
-                  f"被动结构 be + 过去分词，注意时态搭配（{passive_str}）。"
-                  "建议每天练3道填空专项。")
-    elif has_nonfinite:
-        topic = "非谓语动词"
-        advice = (f"做题时根据动词前后结构判断用 doing / to do / done。"
-                  f"本次涉及{'、'.join(nonfinites)}。建议每天练3道填空专项，归纳固定搭配。")
-    else:
-        topic = "动词形式变化"
-        advice = ("做题时先判断主动/被动，再根据动词前后结构判断用 doing / to do / done，"
-                  "建议每天练3道填空专项。")
-
+    dist = "、".join(f"{name}{count}题" for name, count in points) if points else "、".join(labels)
+    advice = ("做题两步走：①定词性——看空格前后缺名词/动词/形容词/副词；"
+              "②变词形——名词看单复数，动词看时态/语态/非谓语，形容词副词看比较级。")
+    if dist:
+        advice += (f"本次共{item_count}题，" if item_count >= 3 else "本次主要涉及：") + f"考点分布：{dist}。"
+    advice += "建议每天练3道填空专项，每空旁标注词性和变形理由。"
     return {"topic": topic, "advice": advice}
 
 
@@ -963,6 +1176,10 @@ def analyze_grammar_fill_section(block_text):
     ②变词形——根据语境变形（时态/被动/非谓语/单复数/比较级）
     """
     forms = []
+    points, item_count = summarize_exam_points(block_text, limit=5, fallback_name="词形变化")
+    blank_count = len(re.findall(r'_{2,}', block_text))
+    if blank_count >= 3:
+        item_count = blank_count
     tenses = detect_tenses(block_text)
     if tenses:
         forms.append(f"时态（{'、'.join(tenses[:3])}）")
@@ -980,11 +1197,15 @@ def analyze_grammar_fill_section(block_text):
     if re.search(r'\b(?:two|three|four|five|six|seven|eight|nine|ten|many|several|some|a few|few|a lot of|lots of|plenty of)\s+\w+s\b', text_l):
         forms.append("名词单复数")
 
-    topic = "语法填空（定词性变词形）"
-    forms_str = "、".join(forms) if forms else "时态/语态/非谓语"
+    # 用逐题统计的考点作为更细的分布
+    detailed = "、".join(f"{name}{count}题" for name, count in points)
+    topic_labels = [name for name, _ in points] or forms
+    topic = "、".join(topic_labels[:3]) + ("等" if len(topic_labels) > 3 else "") if topic_labels else "语法填空"
+    forms_str = detailed or ("、".join(forms) if forms else "时态/语态/非谓语")
     advice = (f"做题两步走：①定词性——空格前后缺什么？主语位缺名词n，谓语位缺动词v，"
               f"修饰位缺形容词adj或副词adv；②变词形——根据句子语境变形。"
-              f"本次重点考点：{forms_str}。"
+              + (f"本次共{item_count}空，" if item_count >= 3 else "本次重点考点：")
+              + f"{forms_str}。"
               "动词变形最常考：看时间标志词定时态（already/yet 配完成时，"
               "last year 配过去时，next week 配将来时）、看主被动关系定语态、"
               "看前后结构定非谓语（to do/doing/done）。"
@@ -1118,24 +1339,17 @@ def analyze_writing_section(block_text):
 
 def analyze_generic_section(block_text, sec_name=""):
     """通用分析器"""
-    tenses = detect_tenses(block_text)
-    clauses = detect_clauses(block_text)
-    passives = detect_passive_voice(block_text)
+    points, item_count = summarize_exam_points(block_text, limit=5)
+    if points:
+        topic = "、".join(name for name, _ in points[:3]) + ("等" if len(points) > 3 else "")
+        dist = "、".join(f"{name}{count}题" for name, count in points)
+        advice = (f"本板块" + (f"共{item_count}题，" if item_count >= 3 else "")
+                  + f"考点分布：{dist}。建议按考点归类错题，"
+                  "每天针对最薄弱的一类练5题，连续一周就能看出提升。")
+        return {"topic": topic, "advice": advice}
 
-    all_points = []
-    if tenses:
-        all_points.extend(tenses)
-    if passives:
-        all_points.append("被动语态")
-    if clauses:
-        all_points.extend(clauses)
-
-    if all_points:
-        topic = "综合语法"
-        advice = f"本板块涉及{'、'.join(all_points[:5])}。建议针对薄弱点专项练习，每天坚持找找感觉。"
-    else:
-        topic = f"{sec_name}板块" if sec_name else "本板块知识"
-        advice = "针对薄弱知识点做专项练习，每天坚持练几道题找找感觉。"
+    topic = f"{sec_name}板块" if sec_name else "本板块知识"
+    advice = "针对薄弱知识点做专项练习，每天坚持练几道题找找感觉。"
     return {"topic": topic, "advice": advice}
 
 
@@ -1182,17 +1396,29 @@ def analyze_pdf_content(text, section_names):
     # 1. 按罗马数字切分试卷文本
     section_blocks = split_pdf_by_sections(text)
 
-    # 2. 把试卷板块映射到 Excel 板块名
+    # 2. 把试卷板块映射到标准板块名（同一个板块的多段内容合并）
     sec_text_map = {}
     for title, content in section_blocks:
         key = map_to_section_key(title, content)
-        if key and key not in sec_text_map:
-            sec_text_map[key] = content
+        if key:
+            sec_text_map[key] = (sec_text_map.get(key, "") + "\n" + content).strip()
 
-    # 3. 对每个板块做针对性分析
+    # 3. 对每个板块做针对性分析（Excel 表头先统一成标准名）
+    whole_text_fallback = len(section_blocks) == 1 and section_blocks[0][0] == "全文"
     for sec_name in section_names:
-        block_text = sec_text_map.get(sec_name, text)
-        analyzer = SECTION_ANALYZERS.get(sec_name)
+        key = canonical_section_name(sec_name)
+        block_text = sec_text_map.get(key, "")
+        if not block_text:
+            if whole_text_fallback:
+                block_text = text
+            else:
+                result[sec_name] = {
+                    "topic": "该板块未在试卷中定位到",
+                    "advice": "这份PDF里没有识别到该板块的题目，可能是扫描版或标题格式特殊。"
+                              "可以先手动填写考点，或换一份可复制文字的PDF再试。",
+                }
+                continue
+        analyzer = SECTION_ANALYZERS.get(key) or SECTION_ANALYZERS.get(sec_name)
         if analyzer:
             result[sec_name] = analyzer(block_text)
         else:
@@ -1829,37 +2055,56 @@ def generate():
     total_max = sum(m for _, m in sections)
     print(f"开始生成 {len(students)} 份报告...")
 
-    generated = generate_reports(students, sections, cfg, logo_b64, mascot_b64, OUTPUT_DIR, edited_map=edited_map)
+    # 每次生成使用独立目录，避免不同老师看到彼此的学生报告
+    run_id, run_dir = new_run_dir()
 
-    print(f"完成！{len(generated)} 份报告已保存到 {OUTPUT_DIR}")
+    generated = generate_reports(students, sections, cfg, logo_b64, mascot_b64, run_dir, edited_map=edited_map)
 
-    return render_template("results.html", reports=generated, total_max=total_max, cfg=cfg)
+    print(f"完成！{len(generated)} 份报告已保存到 {run_dir}")
+
+    return render_template("results.html", reports=generated, total_max=total_max, cfg=cfg, run_id=run_id)
 
 
-@app.route("/reports/<filename>")
-def serve_report(filename):
-    path = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(path):
+def _safe_report_path(run_id, filename):
+    """只允许访问当前批次目录下的报告文件"""
+    if not re.fullmatch(r'[0-9A-Za-z_]+', run_id or ''):
+        return None
+    filename = os.path.basename(filename or '')
+    path = os.path.join(OUTPUT_DIR, run_id, filename)
+    return path if os.path.isfile(path) else None
+
+
+@app.route("/reports/<run_id>/<path:filename>")
+def serve_report(run_id, filename):
+    path = _safe_report_path(run_id, filename)
+    if path:
         return send_file(path, mimetype="image/png")
-    return "文件不存在", 404
+    return "文件不存在或已过期，请重新生成", 404
 
 
-@app.route("/reports_pdf/<filename>")
-def serve_report_pdf(filename):
-    path = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(path):
+@app.route("/reports_pdf/<run_id>/<path:filename>")
+def serve_report_pdf(run_id, filename):
+    path = _safe_report_path(run_id, filename)
+    if path:
         return send_file(path, mimetype="application/pdf")
-    return "文件不存在", 404
+    return "文件不存在或已过期，请重新生成", 404
 
 
 @app.route("/download_all")
 def download_all():
-    """打包下载所有报告（PNG + PDF）"""
-    zip_path = os.path.join(OUTPUT_DIR, "_all_reports.zip")
+    """打包下载当前批次的报告（PNG + PDF）"""
+    run_id = request.args.get("run", "")
+    if not re.fullmatch(r'[0-9A-Za-z_]+', run_id or ''):
+        return "下载链接已失效，请重新生成", 404
+    run_dir = os.path.join(OUTPUT_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return "下载链接已失效，请重新生成", 404
+
+    zip_path = os.path.join(run_dir, "_all_reports.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in os.listdir(OUTPUT_DIR):
+        for fname in sorted(os.listdir(run_dir)):
             if fname.endswith((".png", ".pdf")) and not fname.startswith("_"):
-                zf.write(os.path.join(OUTPUT_DIR, fname), fname)
+                zf.write(os.path.join(run_dir, fname), fname)
     return send_file(zip_path, as_attachment=True, download_name="反馈报告_全部.zip")
 
 

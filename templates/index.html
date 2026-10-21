@@ -251,7 +251,12 @@ function renderSections(sections) {
     container.appendChild(card);
   });
   // 如果已有PDF分析结果，自动填充到板块
-  applyPdfAdvice();
+  // 若PDF是在上传成绩表之前分析的，这里用真实板块名重新分析一次
+  if (pdfInput.files[0]) {
+    handlePdfUpload();
+  } else {
+    applyPdfAdvice();
+  }
 }
 
 // ---- PDF 试卷上传 ----
