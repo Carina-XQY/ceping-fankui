@@ -8,12 +8,14 @@
 """
 
 import base64
+import gc
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timedelta
@@ -28,7 +30,13 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB max upload
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 预览页版本号：升级分析逻辑后修改，旧预览页提交时会被拒绝，避免旧内容覆盖新结果
-APP_VERSION = "2026-10-21-3"
+APP_VERSION = "2026-10-28-1"
+
+# 报告生成任务（run_id -> 进度信息），用于前端轮询
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+# 同一时间只跑一个生成任务，避免多人同时生成把 512MB 内存撑爆
+GENERATION_LOCK = threading.Lock()
 
 # 默认板块建议（Excel 中出现 config 里没有的板块时用）
 DEFAULT_ADVICE = {
@@ -2328,52 +2336,79 @@ body {{ font-family:"PingFang SC","Microsoft YaHei","Helvetica Neue",sans-serif;
 # ============================================================
 #  报告生成
 # ============================================================
-def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, edited_map=None):
+def generate_reports(students, sections, cfg, logo_b64, mascot_b64, output_dir, edited_map=None,
+                     progress=None):
     """用 Playwright 逐个生成报告图片，返回文件名列表。
     edited_map: 可选 {学生姓名: {overall/teacher_msg/teacher_quote/suggestions}}，覆盖默认内容。
+    progress: 可选回调 (已完成数, 总数, 当前学生姓名)，用于前端轮询进度。
     """
     total_max = sum(m for _, m in sections)
     class_avg = sum(t for _, _, t in students) / len(students) if students else None
     edited_map = edited_map or {}
     generated = []
+    total = len(students)
+    # 每生成 8 份重启一次浏览器，释放 Chromium 累积的内存（云服务器 512MB 也能跑完整班）
+    BROWSER_CHUNK = 8
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-                  "--disable-gpu", "--single-process", "--disable-software-rasterizer"]
-        )
-        page = browser.new_page(viewport={"width": 880, "height": 1200})
+        browser = None
+        page = None
+        try:
+            for idx, (name, scores, total_score) in enumerate(students):
+                if browser is None or idx % BROWSER_CHUNK == 0:
+                    if browser is not None:
+                        try:
+                            page.close()
+                            browser.close()
+                        except Exception:
+                            pass
+                        page = None
+                        browser = None
+                        gc.collect()
+                    browser = p.chromium.launch(
+                        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                              "--disable-gpu", "--single-process", "--disable-software-rasterizer"]
+                    )
+                    page = browser.new_page(viewport={"width": 880, "height": 1200})
 
-        for name, scores, total in students:
-            edited = edited_map.get(name, {})
-            html = build_html(name, scores, total, sections, total_max, cfg, logo_b64, mascot_b64,
-                              edited=edited, class_avg=class_avg)
+                edited = edited_map.get(name, {})
+                html = build_html(name, scores, total_score, sections, total_max, cfg, logo_b64, mascot_b64,
+                                  edited=edited, class_avg=class_avg)
 
-            # 直接设置页面内容（避免中文路径问题）
-            page.set_content(html, wait_until="load")
-            page.wait_for_timeout(600)
+                # 直接设置页面内容（避免中文路径问题）
+                page.set_content(html, wait_until="load")
+                page.wait_for_timeout(600)
 
-            # 生成 PNG
-            img_name = f"{name}_反馈报告.png"
-            img_path = os.path.join(output_dir, img_name)
-            el = page.query_selector(".report")
-            el.screenshot(path=img_path)
+                # 生成 PNG
+                img_name = f"{name}_反馈报告.png"
+                img_path = os.path.join(output_dir, img_name)
+                el = page.query_selector(".report")
+                el.screenshot(path=img_path)
+                el = None
 
-            # 生成 PDF（从 PNG 转换，保证排版一致）
-            pdf_name = f"{name}_反馈报告.pdf"
-            pdf_path = os.path.join(output_dir, pdf_name)
+                # 生成 PDF（从 PNG 转换，保证排版一致）
+                pdf_name = f"{name}_反馈报告.pdf"
+                pdf_path = os.path.join(output_dir, pdf_name)
+                try:
+                    with Image.open(img_path) as im:
+                        if im.mode == "RGBA":
+                            im = im.convert("RGB")
+                        im.save(pdf_path, "PDF", resolution=150.0)
+                except Exception as e:
+                    print(f"  ⚠ PDF 生成失败 {name}: {e}")
+
+                generated.append((name, total_score, total_max, img_name, pdf_name))
+                print(f"  ✓ {name}  {total_score:g}/{total_max:g}")
+                if progress:
+                    progress(idx + 1, total, name)
+        finally:
             try:
-                pdf_img = Image.open(img_path)
-                if pdf_img.mode == "RGBA":
-                    pdf_img = pdf_img.convert("RGB")
-                pdf_img.save(pdf_path, "PDF", resolution=150.0)
-            except Exception as e:
-                print(f"  ⚠ PDF 生成失败 {name}: {e}")
-
-            generated.append((name, total, total_max, img_name, pdf_name))
-            print(f"  ✓ {name}  {total:g}/{total_max:g}")
-
-        browser.close()
+                if page is not None:
+                    page.close()
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
 
     return generated
 
@@ -2478,7 +2513,7 @@ def preview():
     excel_path = os.path.join(UPLOAD_DIR, file_id)
 
     # 如果没有 file_id（直接上传模式），从 request.files 获取
-    if not os.path.exists(excel_path):
+    if not file_id or not os.path.isfile(excel_path):
         if "excel" in request.files:
             f = request.files["excel"]
             ext = os.path.splitext(f.filename)[1].lower() or ".xlsx"
@@ -2599,7 +2634,7 @@ def generate():
     excel_path = os.path.join(UPLOAD_DIR, file_id)
 
     # 如果没有 file_id（直接上传模式），从 request.files 获取
-    if not os.path.exists(excel_path):
+    if not file_id or not os.path.isfile(excel_path):
         if "excel" in request.files:
             f = request.files["excel"]
             ext = os.path.splitext(f.filename)[1].lower() or ".xlsx"
@@ -2708,11 +2743,77 @@ def generate():
     # 每次生成使用独立目录，避免不同老师看到彼此的学生报告
     run_id, run_dir = new_run_dir()
 
-    generated = generate_reports(students, sections, cfg, logo_b64, mascot_b64, run_dir, edited_map=edited_map)
+    # 后台线程生成 + 前端轮询进度：人数多时请求不会超时，也不会卡住页面
+    job = {
+        "status": "running",
+        "done": 0,
+        "total": len(students),
+        "current": students[0][0] if students else "",
+        "reports": [],
+        "total_max": total_max,
+        "cfg": cfg,
+        "error": "",
+    }
+    with JOBS_LOCK:
+        JOBS[run_id] = job
 
-    print(f"完成！{len(generated)} 份报告已保存到 {run_dir}")
+    def _progress(done, total, name):
+        job["done"] = done
+        job["current"] = name
 
-    return render_template("results.html", reports=generated, total_max=total_max, cfg=cfg, run_id=run_id)
+    def _run():
+        try:
+            with GENERATION_LOCK:
+                generated = generate_reports(students, sections, cfg, logo_b64, mascot_b64, run_dir,
+                                            edited_map=edited_map, progress=_progress)
+            job["reports"] = generated
+            with open(os.path.join(run_dir, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({"reports": generated, "total_max": total_max, "cfg": cfg}, f, ensure_ascii=False)
+            job["status"] = "done"
+            print(f"完成！{len(generated)} 份报告已保存到 {run_dir}")
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            print(f"生成失败 {run_id}: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return render_template("generating.html", run_id=run_id, total=len(students))
+
+
+@app.route("/progress/<run_id>")
+def progress(run_id):
+    """轮询生成进度"""
+    with JOBS_LOCK:
+        job = JOBS.get(run_id)
+        if not job:
+            return jsonify({"status": "error", "error": "任务不存在或服务已重启，请重新生成"}), 404
+        return jsonify({
+            "status": job["status"],
+            "done": job["done"],
+            "total": job["total"],
+            "current": job["current"],
+            "error": job["error"],
+        })
+
+
+@app.route("/results/<run_id>")
+def results(run_id):
+    """生成完成后展示报告列表"""
+    with JOBS_LOCK:
+        job = JOBS.get(run_id)
+        data = None
+        if job and job["status"] == "done":
+            data = {"reports": job["reports"], "total_max": job["total_max"], "cfg": job["cfg"]}
+    if data is None:
+        job_file = os.path.join(OUTPUT_DIR, run_id, "job.json")
+        if os.path.isfile(job_file):
+            with open(job_file, encoding="utf-8") as f:
+                data = json.load(f)
+    if not data:
+        return "报告还没有生成完成，或链接已过期，请重新生成", 404
+    return render_template("results.html", reports=data["reports"], total_max=data["total_max"],
+                           cfg=data["cfg"], run_id=run_id)
 
 
 def _safe_report_path(run_id, filename):

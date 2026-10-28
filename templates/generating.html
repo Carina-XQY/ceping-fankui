@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>正在生成报告</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: linear-gradient(135deg, #E3F2FD, #E1F5FE); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.card { background: #fff; border-radius: 20px; box-shadow: 0 8px 32px rgba(33,150,243,0.15); padding: 40px 36px; max-width: 480px; width: 100%; text-align: center; }
+.spinner { width: 52px; height: 52px; border: 5px solid #BBDEFB; border-top-color: #1565C0; border-radius: 50%; animation: spin 0.9s linear infinite; margin: 0 auto 22px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+h1 { font-size: 21px; color: #0D47A1; margin-bottom: 10px; }
+.desc { font-size: 14px; color: #1565C0; line-height: 1.7; margin-bottom: 24px; }
+.bar-wrap { background: #E3F2FD; border-radius: 999px; height: 12px; overflow: hidden; margin-bottom: 12px; }
+.bar { height: 100%; width: 0; background: linear-gradient(90deg, #42A5F5, #1565C0); border-radius: 999px; transition: width 0.4s ease; }
+.meta { font-size: 13px; color: #90A4AE; }
+.meta b { color: #1565C0; }
+.error { display: none; margin-top: 18px; padding: 14px; background: #FFEBEE; color: #C62828; border-radius: 10px; font-size: 14px; line-height: 1.6; text-align: left; }
+.back { display: none; margin-top: 18px; }
+.back a { display: inline-block; padding: 10px 22px; background: #E3F2FD; color: #1565C0; border-radius: 10px; text-decoration: none; font-size: 14px; font-weight: 600; }
+.tip { margin-top: 20px; font-size: 12px; color: #B0BEC5; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="spinner" id="spinner"></div>
+  <h1 id="title">正在生成 {{ total }} 份报告</h1>
+  <p class="desc">请保持这个页面打开，不要刷新或关闭<br>生成完成后会自动跳转</p>
+  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+  <div class="meta" id="meta">已完成 <b>0</b> / {{ total }}</div>
+  <div class="error" id="errorBox"></div>
+  <div class="back" id="backBox"><a href="/">← 返回首页重新生成</a></div>
+  <div class="tip">人数较多时需要一些时间，页面会自动等待</div>
+</div>
+
+<script>
+const RUN_ID = {{ run_id|tojson }};
+const TOTAL = {{ total }};
+const bar = document.getElementById('bar');
+const meta = document.getElementById('meta');
+const title = document.getElementById('title');
+const errorBox = document.getElementById('errorBox');
+const backBox = document.getElementById('backBox');
+const spinner = document.getElementById('spinner');
+
+let tries = 0;
+function poll() {
+  fetch('/progress/' + RUN_ID)
+    .then(r => r.json())
+    .then(d => {
+      if (d.status === 'done') {
+        bar.style.width = '100%';
+        meta.innerHTML = '已完成 <b>' + d.total + '</b> / ' + TOTAL + '，正在打开结果…';
+        location.href = '/results/' + RUN_ID;
+        return;
+      }
+      if (d.status === 'error') {
+        spinner.style.display = 'none';
+        title.textContent = '生成中断了';
+        errorBox.style.display = 'block';
+        errorBox.textContent = '原因：' + (d.error || '服务器在生成过程中重启了') + '。请返回首页重新生成；如果反复失败，请减少一次导入的学生人数。';
+        backBox.style.display = 'block';
+        return;
+      }
+      const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+      bar.style.width = pct + '%';
+      meta.innerHTML = '已完成 <b>' + d.done + '</b> / ' + d.total + '（' + pct + '%）' + (d.current ? ' · 正在生成：' + d.current : '');
+      tries = 0;
+      setTimeout(poll, 1200);
+    })
+    .catch(() => {
+      tries += 1;
+      if (tries > 40) {
+        spinner.style.display = 'none';
+        title.textContent = '连接中断';
+        errorBox.style.display = 'block';
+        errorBox.textContent = '无法获取生成进度，可能是服务器重连中。请稍等后刷新本页，或返回首页重新生成。';
+        backBox.style.display = 'block';
+        return;
+      }
+      setTimeout(poll, 1500);
+    });
+}
+poll();
+</script>
+</body>
+</html>
